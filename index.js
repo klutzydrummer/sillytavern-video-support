@@ -147,6 +147,23 @@ function clearVideo() {
     $('#video_support_indicator').hide();
 }
 
+function onMessageSent(messageId) {
+    if (!pendingVideo) return;
+
+    // Append a video preview to the sent message bubble
+    const msgEl = $(`.mes[mesid="${messageId}"] .mes_text`);
+    if (msgEl.length) {
+        const preview = $(`
+            <video class="video-support-preview" controls preload="metadata">
+                <source src="${pendingVideo.dataUrl}" type="${pendingVideo.dataUrl.split(';')[0].slice(5)}">
+            </video>
+        `);
+        msgEl.append(preview);
+    }
+
+    clearVideo();
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -173,6 +190,6 @@ function formatBytes(n) {
 jQuery(async () => {
     patchFetch();
     createUI();
-    eventSource.on(event_types.MESSAGE_SENT, clearVideo);
+    eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
     console.log('[VideoSupport] Loaded');
 });

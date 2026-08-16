@@ -54,3 +54,11 @@
     opacity: 1;
     color: #e07070;
 }
+
+.video-support-preview {
+    display: block;
+    max-width: 100%;
+    max-height: 360px;
+    margin-top: 6px;
+    border-radius: 6px;
+}
