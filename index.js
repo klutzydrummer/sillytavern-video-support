@@ -179,18 +179,20 @@ function clearVideo() {
 function onMessageSent(messageId) {
     if (!pendingVideo) return;
 
-    // Append a video preview to the sent message bubble.
-    // Don't clear pendingVideo here — the fetch rewrite needs it and clears it after injection.
-    const msgEl = $(`.mes[mesid="${messageId}"] .mes_text`);
-    if (msgEl.length) {
-        const mimeType = pendingVideo.dataUrl.split(';')[0].slice(5);
-        const preview = $(`
+    // Snapshot dataUrl now — pendingVideo will be cleared by the fetch rewrite before the timeout fires
+    const { dataUrl } = pendingVideo;
+    const mimeType = dataUrl.split(';')[0].slice(5);
+
+    // Wait for ST to render the message bubble before appending the preview
+    setTimeout(() => {
+        const msgEl = $(`.mes[mesid="${messageId}"] .mes_text`);
+        if (!msgEl.length) return;
+        msgEl.append($(`
             <video class="video-support-preview" controls preload="metadata">
-                <source src="${pendingVideo.dataUrl}" type="${mimeType}">
+                <source src="${dataUrl}" type="${mimeType}">
             </video>
-        `);
-        msgEl.append(preview);
-    }
+        `));
+    }, 500);
 }
 
 // ---------------------------------------------------------------------------
