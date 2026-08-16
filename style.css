@@ -1,0 +1,42 @@
+/* SillyTavern Video Support Extension */
+
+#video_support_indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    margin: 4px 0;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.3));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.15));
+    border-radius: 6px;
+    font-size: 0.85em;
+    color: var(--SmartThemeBodyColor, #ccc);
+}
+
+.video-support-icon {
+    color: var(--SmartThemeQuoteColor, #7eb8f7);
+    font-size: 1em;
+}
+
+.video-support-filename {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+}
+
+.video-support-clear {
+    background: none;
+    border: none;
+    color: var(--SmartThemeBodyColor, #ccc);
+    cursor: pointer;
+    padding: 0 2px;
+    opacity: 0.7;
+    transition: opacity 0.15s;
+}
+
+.video-support-clear:hover {
+    opacity: 1;
+    color: #e07070;
+}
