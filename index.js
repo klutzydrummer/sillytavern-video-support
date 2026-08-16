@@ -125,7 +125,7 @@ function createUI() {
     } else {
         $('#options_button').after(btn);
     }
-    indicator.insertBefore('#send_textarea');
+    indicator.insertBefore('#nonQRFormItems');
 
     // Events
     btn.on('click', () => fileInput.trigger('click'));
