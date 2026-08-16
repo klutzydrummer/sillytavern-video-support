@@ -100,9 +100,11 @@ function createUI() {
     });
     $('body').append(fileInput);
 
-    // Attach button — placed inside #send_form next to other action buttons
+    // Attach button — placed in the left send form next to the hamburger button
     const btn = $(`
-        <div id="video_support_btn" class="fa-solid fa-film" title="Attach video (llama.cpp)"></div>
+        <div id="video_support_btn" title="Attach video (llama.cpp)">
+            <i class="fa-solid fa-film"></i>
+        </div>
     `);
 
     // Indicator shown above the textarea when a video is staged
@@ -114,8 +116,8 @@ function createUI() {
         </div>
     `);
 
-    // Insert button into the send form action area
-    $('#send_form').prepend(btn);
+    // Insert after the hamburger/options button in the left send form
+    $('#leftSendForm').append(btn);
     indicator.insertBefore('#send_textarea');
 
     // Events

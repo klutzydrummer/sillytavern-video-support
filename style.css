@@ -5,8 +5,9 @@
     padding: 4px 6px;
     opacity: 0.7;
     transition: opacity 0.15s, color 0.15s;
-    font-size: 1em;
-    align-self: center;
+    font-size: 1.2em;
+    display: flex;
+    align-items: center;
 }
 
 #video_support_btn:hover {
