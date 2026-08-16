@@ -35,7 +35,7 @@ function patchFetch() {
             options.body &&
             typeof options.body === 'string' &&
             typeof url === 'string' &&
-            isGenerationRequest(url, options.body)
+            isGenerationRequest(url)
         ) {
             try {
                 options = injectVideo(options);
@@ -48,19 +48,11 @@ function patchFetch() {
 }
 
 /**
- * Returns true for any request that looks like an outgoing chat generation.
- * Matches direct /chat/completions calls and ST's own proxy paths.
+ * Returns true only for the actual generation request, not preliminary
+ * requests like tokenization or context counting that also carry messages.
  */
-function isGenerationRequest(url, body) {
-    if (url.includes('/chat/completions') || url.includes('/api/backends/') || url.includes('/api/openai/')) {
-        return true;
-    }
-    // Fallback: any POST with a messages array
-    try {
-        return Array.isArray(JSON.parse(body).messages);
-    } catch {
-        return false;
-    }
+function isGenerationRequest(url) {
+    return url.includes('/generate') || url.includes('/chat/completions');
 }
 
 /**
