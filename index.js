@@ -35,7 +35,7 @@ function patchFetch() {
             options.body &&
             typeof options.body === 'string' &&
             typeof url === 'string' &&
-            url.includes('/chat/completions')
+            isGenerationRequest(url, options.body)
         ) {
             try {
                 options = injectVideo(options);
@@ -45,6 +45,22 @@ function patchFetch() {
         }
         return originalFetch.call(this, url, options);
     };
+}
+
+/**
+ * Returns true for any request that looks like an outgoing chat generation.
+ * Matches direct /chat/completions calls and ST's own proxy paths.
+ */
+function isGenerationRequest(url, body) {
+    if (url.includes('/chat/completions') || url.includes('/api/backends/') || url.includes('/api/openai/')) {
+        return true;
+    }
+    // Fallback: any POST with a messages array
+    try {
+        return Array.isArray(JSON.parse(body).messages);
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -82,6 +98,10 @@ function injectVideo(options) {
     });
 
     console.debug('[VideoSupport] Injected input_video into API payload:', pendingVideo.fileName);
+
+    // Clear now — after injection, before the request flies
+    pendingVideo = null;
+    $('#video_support_indicator').hide();
 
     return { ...options, body: JSON.stringify(body) };
 }
@@ -159,18 +179,18 @@ function clearVideo() {
 function onMessageSent(messageId) {
     if (!pendingVideo) return;
 
-    // Append a video preview to the sent message bubble
+    // Append a video preview to the sent message bubble.
+    // Don't clear pendingVideo here — the fetch rewrite needs it and clears it after injection.
     const msgEl = $(`.mes[mesid="${messageId}"] .mes_text`);
     if (msgEl.length) {
+        const mimeType = pendingVideo.dataUrl.split(';')[0].slice(5);
         const preview = $(`
             <video class="video-support-preview" controls preload="metadata">
-                <source src="${pendingVideo.dataUrl}" type="${pendingVideo.dataUrl.split(';')[0].slice(5)}">
+                <source src="${pendingVideo.dataUrl}" type="${mimeType}">
             </video>
         `);
         msgEl.append(preview);
     }
-
-    clearVideo();
 }
 
 // ---------------------------------------------------------------------------
