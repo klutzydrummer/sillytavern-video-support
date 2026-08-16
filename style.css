@@ -2,16 +2,9 @@
 
 #video_support_btn {
     cursor: pointer;
-    padding: 4px 6px;
-    opacity: 0.7;
-    transition: opacity 0.15s, color 0.15s;
-    font-size: 1.2em;
-    display: flex;
-    align-items: center;
 }
 
-#video_support_btn:hover {
-    opacity: 1;
+#video_support_btn:hover .extensionsMenuExtensionButton {
     color: var(--SmartThemeQuoteColor, #7eb8f7);
 }
 

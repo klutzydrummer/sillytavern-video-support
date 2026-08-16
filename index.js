@@ -100,10 +100,11 @@ function createUI() {
     });
     $('body').append(fileInput);
 
-    // Attach button — placed in the left send form next to the hamburger button
+    // Attach button — placed in the options popup menu (same as caption/other extensions)
     const btn = $(`
-        <div id="video_support_btn" title="Attach video (llama.cpp)">
-            <i class="fa-solid fa-film"></i>
+        <div id="video_support_btn" class="list-group-item flex-container flexGap5" title="Attach video (llama.cpp)">
+            <i class="fa-solid fa-film extensionsMenuExtensionButton"></i>
+            <span>Attach Video</span>
         </div>
     `);
 
@@ -116,8 +117,14 @@ function createUI() {
         </div>
     `);
 
-    // Insert after the hamburger/options button in the left send form
-    $('#leftSendForm').append(btn);
+    // Insert into the options popup — same place caption/other extensions put their buttons.
+    // Try known container IDs in order; fall back to appending after #options_button.
+    const menuTarget = $('#extensionsMenu, #options_popup, #send_form .options-content').first();
+    if (menuTarget.length) {
+        menuTarget.append(btn);
+    } else {
+        $('#options_button').after(btn);
+    }
     indicator.insertBefore('#send_textarea');
 
     // Events
