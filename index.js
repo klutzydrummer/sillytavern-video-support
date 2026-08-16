@@ -1,21 +1,21 @@
 /**
  * SillyTavern Video Support Extension for llama.cpp
  *
- * Adds a dedicated video attach button that bypasses ST's media pipeline
- * entirely. Video is injected directly into the API payload as input_video
- * in the fetch rewrite, so ST's image/caption handling never touches it.
+ * ST's OpenAI-compat pipeline explicitly skips video (videoInlining=false
+ * for custom backends), so this extension bridges the gap:
  *
- * Video data is persisted in message.extra so previews survive regeneration,
- * swipes, and branch switching. On regeneration the stored video is
- * automatically re-injected into the new generation request.
- *
- * Requires llama.cpp server built with mtmd support and ffmpeg installed.
+ *  - Attaches video to messages via extra.media (ST's native format) so
+ *    persistence, saving, and branch/swipe handling come for free
+ *  - Renders <video> previews via USER_MESSAGE_RENDERED since ST doesn't
+ *    render video for non-Gemini backends
+ *  - Injects input_video into the API payload via a fetch rewrite, reading
+ *    from extra.media on the last user message
  */
 
 import { chat, eventSource, event_types, saveChatConditional } from '../../../../script.js';
 
 // ---------------------------------------------------------------------------
-// State
+// State — only held until MESSAGE_SENT moves it into extra.media
 // ---------------------------------------------------------------------------
 
 /** @type {{ dataUrl: string, fileName: string } | null} */
@@ -24,7 +24,7 @@ let pendingVideo = null;
 let fetchPatched = false;
 
 // ---------------------------------------------------------------------------
-// fetch() patch — injects input_video directly into the API payload
+// fetch() patch — bridges extra.media → input_video for llama.cpp
 // ---------------------------------------------------------------------------
 
 function patchFetch() {
@@ -40,12 +40,12 @@ function patchFetch() {
             typeof url === 'string' &&
             isGenerationRequest(url)
         ) {
-            const videoDataUrl = pendingVideo?.dataUrl ?? getLastUserVideoFromChat();
-            if (videoDataUrl) {
+            const videoUrl = getVideoFromLastUserMessage();
+            if (videoUrl) {
                 try {
-                    options = injectVideo(options, videoDataUrl);
+                    options = injectInputVideo(options, videoUrl);
                 } catch (err) {
-                    console.error('[VideoSupport] Failed to inject video into request:', err);
+                    console.error('[VideoSupport] Failed to inject video:', err);
                 }
             }
         }
@@ -57,23 +57,19 @@ function isGenerationRequest(url) {
     return url.includes('/generate') || url.includes('/chat/completions');
 }
 
-/**
- * For regeneration/swipes: find the video stored on the most recent user message.
- */
-function getLastUserVideoFromChat() {
+/** Read video from extra.media on the most recent user message. */
+function getVideoFromLastUserMessage() {
     if (!Array.isArray(chat)) return null;
     for (let i = chat.length - 1; i >= 0; i--) {
-        if (chat[i].is_user && chat[i].extra?.video_url) {
-            return chat[i].extra.video_url;
-        }
+        if (!chat[i].is_user) continue;
+        const video = chat[i].extra?.media?.find(m => m.type === 'video');
+        if (video?.url) return video.url;
     }
     return null;
 }
 
-/**
- * Finds the last user message in the payload and appends an input_video part.
- */
-function injectVideo(options, videoDataUrl) {
+/** Append an input_video part to the last user message in the request body. */
+function injectInputVideo(options, videoUrl) {
     const body = JSON.parse(options.body);
     if (!Array.isArray(body.messages)) return options;
 
@@ -90,61 +86,58 @@ function injectVideo(options, videoDataUrl) {
         msg.content = [];
     }
 
-    msg.content.push({ type: 'input_video', input_video: { url: videoDataUrl } });
-
+    msg.content.push({ type: 'input_video', input_video: { url: videoUrl } });
     console.debug('[VideoSupport] Injected input_video into API payload');
-
-    // Clear pending state — video is now persisted in the chat message extra
-    if (pendingVideo) {
-        pendingVideo = null;
-        $('#video_support_indicator').hide();
-    }
 
     return { ...options, body: JSON.stringify(body) };
 }
 
 // ---------------------------------------------------------------------------
-// Render video preview inside a message bubble
+// Message events
 // ---------------------------------------------------------------------------
 
-function renderPreview(messageId, dataUrl) {
-    const msgEl = $(`.mes[mesid="${messageId}"] .mes_text`);
-    if (!msgEl.length || msgEl.find('.video-support-preview').length) return;
-    const mimeType = dataUrl.split(';')[0].slice(5);
-    msgEl.append($(`
-        <video class="video-support-preview" controls preload="metadata">
-            <source src="${dataUrl}" type="${mimeType}">
-        </video>
-    `));
-}
-
-// ---------------------------------------------------------------------------
-// Event handlers
-// ---------------------------------------------------------------------------
-
-function onMessageSent(messageId) {
+/** On send: move pendingVideo into extra.media and persist. */
+async function onMessageSent(messageId) {
     if (!pendingVideo) return;
 
-    const { dataUrl, fileName } = pendingVideo;
+    const msg = chat[messageId];
+    if (!msg) return;
 
-    // Persist in chat message so it survives regeneration and branching
-    if (chat[messageId]) {
-        if (!chat[messageId].extra) chat[messageId].extra = {};
-        chat[messageId].extra.video_url = dataUrl;
-        saveChatConditional();
-    }
+    if (!msg.extra) msg.extra = {};
+    if (!Array.isArray(msg.extra.media)) msg.extra.media = [];
 
-    // Render preview — wait for ST to paint the bubble first
-    setTimeout(() => renderPreview(messageId, dataUrl), 500);
+    msg.extra.media.push({
+        type: 'video',
+        url: pendingVideo.dataUrl,
+        title: pendingVideo.fileName,
+        source: 'upload',
+    });
 
-    console.debug('[VideoSupport] Saved video to message', messageId, fileName);
+    pendingVideo = null;
+    $('#video_support_indicator').hide();
+
+    await saveChatConditional();
+    console.debug('[VideoSupport] Saved video to message', messageId);
 }
 
+/**
+ * On render: draw <video> for any message that has video in extra.media.
+ * ST doesn't render video for custom OpenAI backends, so we do it here.
+ */
 function onUserMessageRendered(messageId) {
     const msg = chat[messageId];
-    if (msg?.extra?.video_url) {
-        renderPreview(messageId, msg.extra.video_url);
-    }
+    const video = msg?.extra?.media?.find(m => m.type === 'video');
+    if (!video?.url) return;
+
+    const container = $(`.mes[mesid="${messageId}"] .mes_text`);
+    if (!container.length || container.find('.video-support-preview').length) return;
+
+    const mimeType = video.url.split(';')[0].slice(5);
+    container.append($(`
+        <video class="video-support-preview" controls preload="metadata">
+            <source src="${video.url}" type="${mimeType}">
+        </video>
+    `));
 }
 
 // ---------------------------------------------------------------------------
