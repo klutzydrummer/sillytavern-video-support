@@ -1,9 +1,9 @@
 /**
  * SillyTavern Video Support Extension for llama.cpp
  *
- * Hooks into ST's built-in image/video attachment button (#img_file) to
- * intercept video file selections, then converts ST's internal video format
- * to the input_video content type expected by llama.cpp's multimodal API.
+ * Adds a dedicated video attach button that bypasses ST's media pipeline
+ * entirely. Video is injected directly into the API payload as input_video
+ * in the fetch rewrite, so ST's image/caption handling never touches it.
  *
  * Requires llama.cpp server built with mtmd support and ffmpeg installed.
  */
@@ -11,17 +11,16 @@
 import { eventSource, event_types } from '../../../../script.js';
 
 // ---------------------------------------------------------------------------
-// Extension state
+// State
 // ---------------------------------------------------------------------------
 
-/** @type {{ dataUrl: string, mimeType: string, fileName: string } | null} */
+/** @type {{ dataUrl: string, fileName: string } | null} */
 let pendingVideo = null;
 
-/** Whether we've already patched window.fetch this session */
 let fetchPatched = false;
 
 // ---------------------------------------------------------------------------
-// fetch() patch — converts video_url → input_video for llama.cpp
+// fetch() patch — injects input_video directly into the API payload
 // ---------------------------------------------------------------------------
 
 function patchFetch() {
@@ -35,155 +34,115 @@ function patchFetch() {
             pendingVideo !== null &&
             options.body &&
             typeof options.body === 'string' &&
-            isChatCompletionsEndpoint(url)
+            typeof url === 'string' &&
+            url.includes('/chat/completions')
         ) {
             try {
-                options = rewriteVideoRequest(options);
+                options = injectVideo(options);
             } catch (err) {
-                console.error('[VideoSupport] Failed to rewrite request:', err);
+                console.error('[VideoSupport] Failed to inject video into request:', err);
             }
         }
         return originalFetch.call(this, url, options);
     };
 }
 
-function isChatCompletionsEndpoint(url) {
-    if (typeof url !== 'string') return false;
-    return url.includes('/chat/completions');
-}
-
 /**
- * Rewrites the fetch options body, replacing any video_url content parts
- * with the input_video format that llama.cpp expects.
+ * Finds the last user message in the payload and appends an input_video
+ * content part. Converts string content to a content array if needed.
  */
-function rewriteVideoRequest(options) {
+function injectVideo(options) {
     const body = JSON.parse(options.body);
 
     if (!Array.isArray(body.messages)) return options;
 
-    let modified = false;
+    // Find the last user message
+    let targetIdx = -1;
+    for (let i = body.messages.length - 1; i >= 0; i--) {
+        if (body.messages[i].role === 'user') {
+            targetIdx = i;
+            break;
+        }
+    }
 
-    body.messages = body.messages.map((msg) => {
-        if (!Array.isArray(msg.content)) return msg;
+    if (targetIdx === -1) return options;
 
-        const newContent = msg.content.map((part) => {
-            // ST generates video_url (Gemini format) — convert to input_video (llama.cpp format)
-            if (part.type === 'video_url' && part.video_url?.url) {
-                modified = true;
-                return {
-                    type: 'input_video',
-                    input_video: { url: part.video_url.url },
-                };
-            }
-            return part;
-        });
+    const msg = body.messages[targetIdx];
 
-        return { ...msg, content: newContent };
+    // Normalise content to an array
+    if (typeof msg.content === 'string') {
+        msg.content = [{ type: 'text', text: msg.content }];
+    } else if (!Array.isArray(msg.content)) {
+        msg.content = [];
+    }
+
+    msg.content.push({
+        type: 'input_video',
+        input_video: { url: pendingVideo.dataUrl },
     });
 
-    if (modified) {
-        console.debug('[VideoSupport] Rewrote video_url → input_video in API request');
-    }
+    console.debug('[VideoSupport] Injected input_video into API payload:', pendingVideo.fileName);
 
     return { ...options, body: JSON.stringify(body) };
 }
 
 // ---------------------------------------------------------------------------
-// generate_interceptor — injects pending video into the last user message
+// UI
 // ---------------------------------------------------------------------------
 
-/**
- * Called by ST before every generation. `chat` is a mutable array of message objects.
- * We inject the pending video into the most recent user message so that ST's
- * prompt-building pipeline picks it up and includes it in the API call.
- */
-async function videoSupportInterceptor(chat, contextSize, abort, type) {
-    if (!pendingVideo) return;
-
-    const lastUserMsg = [...chat].reverse().find((m) => m.is_user);
-    if (!lastUserMsg) return;
-
-    if (!lastUserMsg.extra) lastUserMsg.extra = {};
-    if (!Array.isArray(lastUserMsg.extra.media)) lastUserMsg.extra.media = [];
-
-    lastUserMsg.extra.media.push({
-        url: pendingVideo.dataUrl,
-        type: 'video', // MEDIA_TYPE.VIDEO
-        title: pendingVideo.fileName,
-        source: 'upload',
+function createUI() {
+    // Hidden file input — completely separate from ST's #img_file
+    const fileInput = $('<input>', {
+        type: 'file',
+        accept: 'video/*',
+        id: 'video_support_file_input',
+        css: { display: 'none' },
     });
+    $('body').append(fileInput);
 
-    console.debug('[VideoSupport] Injected video into message:', pendingVideo.fileName);
-}
+    // Attach button — placed inside #send_form next to other action buttons
+    const btn = $(`
+        <div id="video_support_btn" class="fa-solid fa-film" title="Attach video (llama.cpp)"></div>
+    `);
 
-window.videoSupportInterceptor = videoSupportInterceptor;
-
-// ---------------------------------------------------------------------------
-// Hook into ST's built-in attachment button (#img_file)
-// ---------------------------------------------------------------------------
-
-function hookBuiltinAttachment() {
-    // ST's caption extension creates #img_file — wait for it to exist
-    const target = document.querySelector('#img_file') ?? document.querySelector('#img_form input[type="file"]');
-
-    if (!target) {
-        // Caption extension may not have initialised yet; retry after a tick
-        setTimeout(hookBuiltinAttachment, 500);
-        return;
-    }
-
-    // We prepend our listener so it fires before the caption extension's handler.
-    // If the file is a video, we consume it ourselves and show the indicator.
-    // The caption extension's handler will still fire but returns early for
-    // non-Google APIs (isVideoCaptioningAvailable() === false), so no conflict.
-    target.addEventListener(
-        'change',
-        async (e) => {
-            const file = e.target.files?.[0];
-            if (!file || !file.type.startsWith('video/')) return;
-
-            try {
-                const dataUrl = await readFileAsDataUrl(file);
-                pendingVideo = { dataUrl, mimeType: file.type, fileName: file.name };
-                showIndicator();
-                console.debug('[VideoSupport] Staged video via built-in attachment:', file.name, `(${formatBytes(file.size)})`);
-            } catch (err) {
-                console.error('[VideoSupport] Failed to read video file:', err);
-                toastr.error('Failed to read video file.', 'Video Support');
-            }
-        },
-        true, // capture phase — runs before ST's bubble-phase handlers
-    );
-
-    console.debug('[VideoSupport] Hooked into built-in attachment input');
-}
-
-// ---------------------------------------------------------------------------
-// Indicator UI
-// ---------------------------------------------------------------------------
-
-function createIndicator() {
+    // Indicator shown above the textarea when a video is staged
     const indicator = $(`
-        <div id="video_support_indicator" class="video-support-indicator" style="display:none;">
-            <span class="video-support-icon"><i class="fa-solid fa-film"></i></span>
-            <span id="video_support_filename" class="video-support-filename"></span>
-            <button id="video_support_clear_btn" class="video-support-clear" title="Remove video">
-                <i class="fa-solid fa-times"></i>
-            </button>
+        <div id="video_support_indicator" style="display:none;">
+            <i class="fa-solid fa-film"></i>
+            <span id="video_support_filename"></span>
+            <button id="video_support_clear" title="Remove video">&#x2715;</button>
         </div>
     `);
 
+    // Insert button into the send form action area
+    $('#send_form').prepend(btn);
     indicator.insertBefore('#send_textarea');
 
-    $(document).on('click', '#video_support_clear_btn', clearPendingVideo);
+    // Events
+    btn.on('click', () => fileInput.trigger('click'));
+
+    fileInput.on('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        try {
+            pendingVideo = {
+                dataUrl: await readAsDataUrl(file),
+                fileName: file.name,
+            };
+            $('#video_support_filename').text(file.name);
+            indicator.show();
+            console.debug('[VideoSupport] Staged:', file.name, formatBytes(file.size));
+        } catch (err) {
+            console.error('[VideoSupport] Read failed:', err);
+            toastr.error('Could not read video file.', 'Video Support');
+        }
+        fileInput.val('');
+    });
+
+    $(document).on('click', '#video_support_clear', clearVideo);
 }
 
-function showIndicator() {
-    $('#video_support_filename').text(pendingVideo?.fileName ?? '');
-    $('#video_support_indicator').show();
-}
-
-function clearPendingVideo() {
+function clearVideo() {
     pendingVideo = null;
     $('#video_support_indicator').hide();
 }
@@ -192,7 +151,7 @@ function clearPendingVideo() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function readFileAsDataUrl(file) {
+function readAsDataUrl(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = (e) => resolve(e.target.result);
@@ -201,22 +160,19 @@ function readFileAsDataUrl(file) {
     });
 }
 
-function formatBytes(bytes) {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / 1048576).toFixed(1) + ' MB';
+function formatBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
 }
 
 // ---------------------------------------------------------------------------
-// Initialisation
+// Init
 // ---------------------------------------------------------------------------
 
 jQuery(async () => {
     patchFetch();
-    createIndicator();
-    hookBuiltinAttachment();
-
-    eventSource.on(event_types.MESSAGE_SENT, clearPendingVideo);
-
-    console.log('[VideoSupport] Extension loaded — llama.cpp video support ready');
+    createUI();
+    eventSource.on(event_types.MESSAGE_SENT, clearVideo);
+    console.log('[VideoSupport] Loaded');
 });

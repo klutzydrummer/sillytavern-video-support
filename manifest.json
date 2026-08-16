@@ -6,7 +6,6 @@
     "js": "index.js",
     "css": "style.css",
     "loading_order": 10,
-    "generate_interceptor": "videoSupportInterceptor",
     "requires": [],
     "optional": [],
     "conflict": []
