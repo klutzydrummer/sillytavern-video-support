@@ -122,61 +122,82 @@ async function extractFrames(videoDataUrl) {
 
     const video = document.createElement('video');
     video.muted = true;
+    video.playsInline = true;
     video.preload = 'auto';
+    video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
     video.src = videoDataUrl;
+    document.body.appendChild(video);
 
-    await new Promise((resolve, reject) => {
-        video.onloadedmetadata = resolve;
-        video.onerror = () => reject(new Error('Failed to load video for frame extraction'));
-    });
+    try {
+        await new Promise((resolve, reject) => {
+            video.onloadeddata = resolve;
+            video.onerror = () => reject(new Error('Failed to load video'));
+        });
 
-    // Ensure video data is buffered
-    if (video.readyState < 2) {
-        await new Promise((resolve) => { video.oncanplay = resolve; });
-    }
+        const duration = video.duration;
+        const interval = 1 / fps;
+        const totalPossible = Math.floor(duration * fps);
+        const frameCount = Math.min(totalPossible, maxFrames);
 
-    const duration = video.duration;
-    const interval = 1 / fps;
-    const totalPossible = Math.floor(duration * fps);
-    const frameCount = Math.min(totalPossible, maxFrames);
-
-    if (frameCount <= 0) {
-        console.warn('[VideoSupport] No frames to extract (duration too short or FPS too low)');
-        return [];
-    }
-
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-
-    const scale = Math.min(1, maxDimension / Math.max(video.videoWidth, video.videoHeight));
-    canvas.width = Math.round(video.videoWidth * scale);
-    canvas.height = Math.round(video.videoHeight * scale);
-
-    const frames = [];
-    for (let i = 0; i < frameCount; i++) {
-        video.currentTime = i * interval;
-        await new Promise((resolve) => { video.onseeked = resolve; });
-
-        // Seek alone doesn't force frame decode on many codecs.
-        // Briefly play + requestVideoFrameCallback guarantees the
-        // compositor has an actual frame before we draw.
-        if ('requestVideoFrameCallback' in video) {
-            await new Promise((resolve) => {
-                video.requestVideoFrameCallback(() => {
-                    video.pause();
-                    resolve();
-                });
-                video.play();
-            });
-        } else {
-            // Fallback: play briefly and wait for decoder to catch up
-            video.play();
-            await new Promise((r) => setTimeout(r, 150));
-            video.pause();
+        if (frameCount <= 0) {
+            console.warn('[VideoSupport] No frames to extract');
+            return [];
         }
 
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        frames.push(canvas.toDataURL('image/jpeg', jpegQuality));
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+
+        const scale = Math.min(1, maxDimension / Math.max(video.videoWidth, video.videoHeight));
+        canvas.width = Math.round(video.videoWidth * scale);
+        canvas.height = Math.round(video.videoHeight * scale);
+
+        // Play the video at max speed and capture frames at the right
+        // timestamps. This avoids seeking entirely — seeking is the root
+        // cause of black frames because the decoder doesn't always produce
+        // a frame on seek for non-keyframe positions.
+        const frames = [];
+        const targetTimes = Array.from({ length: frameCount }, (_, i) => i * interval);
+
+        await new Promise((resolve) => {
+            let idx = 0;
+            video.playbackRate = 16; // fast as possible
+
+            function onFrame() {
+                if (idx >= targetTimes.length) {
+                    video.pause();
+                    resolve();
+                    return;
+                }
+                if (video.currentTime >= targetTimes[idx]) {
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    frames.push(canvas.toDataURL('image/jpeg', jpegQuality));
+                    idx++;
+                }
+                if ('requestVideoFrameCallback' in video) {
+                    video.requestVideoFrameCallback(onFrame);
+                } else {
+                    requestAnimationFrame(onFrame);
+                }
+            }
+
+            video.currentTime = 0;
+            video.onseeked = () => {
+                if ('requestVideoFrameCallback' in video) {
+                    video.requestVideoFrameCallback(onFrame);
+                } else {
+                    requestAnimationFrame(onFrame);
+                }
+                video.play();
+            };
+        });
+
+        console.debug(`[VideoSupport] Extracted ${frames.length} frames (${canvas.width}x${canvas.height}, ${fps} fps, q=${jpegQuality})`);
+        return frames;
+    } finally {
+        video.pause();
+        video.removeAttribute('src');
+        video.load();
+        video.remove();
     }
 
     console.debug(`[VideoSupport] Extracted ${frames.length} frames (${canvas.width}x${canvas.height}, ${fps} fps, q=${jpegQuality})`);
