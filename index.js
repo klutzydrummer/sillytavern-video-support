@@ -129,12 +129,20 @@ async function getFFmpeg() {
     const { toBlobURL } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/+esm');
 
     const ffmpeg = new FFmpeg();
-    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.9/dist/esm';
-    const workerURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js';
+    const coreBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.9/dist/esm';
+    const ffmpegBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm';
+
+    // Fetch worker.js and rewrite relative imports to absolute URLs so it works as a blob Worker
+    const workerSrc = await (await fetch(`${ffmpegBaseURL}/worker.js`)).text();
+    const workerPatched = workerSrc
+        .replace(/from\s+["']\.\/const\.js["']/g, `from "${ffmpegBaseURL}/const.js"`)
+        .replace(/from\s+["']\.\/errors\.js["']/g, `from "${ffmpegBaseURL}/errors.js"`);
+    const classWorkerURL = URL.createObjectURL(new Blob([workerPatched], { type: 'text/javascript' }));
+
     await ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-        workerURL: await toBlobURL(workerURL, 'text/javascript'),
+        classWorkerURL,
+        coreURL: await toBlobURL(`${coreBaseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${coreBaseURL}/ffmpeg-core.wasm`, 'application/wasm'),
     });
 
     ffmpegInstance = ffmpeg;
