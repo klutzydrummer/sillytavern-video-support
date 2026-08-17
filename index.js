@@ -44,6 +44,7 @@ const DEFAULTS = {
     maxDimension: 512,
     maxFrames: 128,
     jpegQuality: 0.7,
+    debug: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,7 @@ function applySettingsToUI() {
     $('#video_support_max_dimension').val(settings().maxDimension);
     $('#video_support_max_frames').val(settings().maxFrames);
     $('#video_support_jpeg_quality').val(settings().jpegQuality);
+    $('#video_support_debug').prop('checked', settings().debug);
     toggleFrontendOptions();
 }
 
@@ -96,6 +98,10 @@ function bindSettingsEvents() {
     });
     $('#video_support_jpeg_quality').on('input', function () {
         settings().jpegQuality = Math.max(0.1, Math.min(1.0, Number($(this).val())));
+        saveSettingsDebounced();
+    });
+    $('#video_support_debug').on('change', function () {
+        settings().debug = $(this).is(':checked');
         saveSettingsDebounced();
     });
 }
@@ -160,7 +166,9 @@ async function extractFrames(videoDataUrl) {
 
         // Write video to virtual filesystem
         const videoBytes = dataUrlToUint8Array(videoDataUrl);
-        console.debug(`[VideoSupport] Input video: ${videoBytes.byteLength} bytes, first 4 bytes: ${Array.from(videoBytes.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        if (settings().debug) {
+            console.debug(`[VideoSupport] Input video: ${videoBytes.byteLength} bytes, first 4 bytes: ${Array.from(videoBytes.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+        }
         await ffmpeg.writeFile('input.mp4', videoBytes);
 
         // Map JPEG quality: our 0-1 scale → ffmpeg qscale 1-31 (lower = better)
@@ -181,19 +189,21 @@ async function extractFrames(videoDataUrl) {
             const name = `frame_${String(i).padStart(4, '0')}.jpg`;
             try {
                 const data = await ffmpeg.readFile(name);
-                console.debug(`[VideoSupport] Frame ${i}: ${data.byteLength} bytes`);
                 const blob = new Blob([data], { type: 'image/jpeg' });
                 const dataUrl = await blobToDataUrl(blob);
                 frames.push(dataUrl);
-                // Show first frame as visual debug
-                if (i === 1) {
-                    const img = document.createElement('img');
-                    img.src = dataUrl;
-                    img.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99999;max-width:200px;border:3px solid red;';
-                    img.title = 'Debug: first extracted frame (click to dismiss)';
-                    img.onclick = () => img.remove();
-                    document.body.appendChild(img);
-                    console.debug(`[VideoSupport] Frame 1 data URL length: ${dataUrl.length}`);
+                if (settings().debug) {
+                    console.debug(`[VideoSupport] Frame ${i}: ${data.byteLength} bytes, dataUrl length: ${dataUrl.length}`);
+                    if (i === 1) {
+                        $('#video_support_debug_preview').remove();
+                        const img = document.createElement('img');
+                        img.id = 'video_support_debug_preview';
+                        img.src = dataUrl;
+                        img.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99999;max-width:200px;border:3px solid red;';
+                        img.title = 'Debug: first extracted frame (click to dismiss)';
+                        img.onclick = () => img.remove();
+                        document.body.appendChild(img);
+                    }
                 }
                 await ffmpeg.deleteFile(name);
             } catch {
@@ -460,6 +470,14 @@ function createSettingsUI() {
                         <input type="number" id="video_support_jpeg_quality" class="text_pole" min="0.1" max="1.0" step="0.05" />
                         <small class="video-support-hint">0.1 = smallest, 1.0 = best quality. 0.7 is a good balance.</small>
                     </div>
+                </div>
+                <hr>
+                <div class="video-support-setting">
+                    <label class="checkbox_label" for="video_support_debug">
+                        <input type="checkbox" id="video_support_debug" />
+                        Debug mode
+                    </label>
+                    <small class="video-support-hint">Log frame sizes to console and show first extracted frame as a preview overlay.</small>
                 </div>
             </div>
         </div>
