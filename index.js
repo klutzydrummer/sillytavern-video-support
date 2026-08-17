@@ -12,10 +12,31 @@
  */
 
 import { chat, eventSource, event_types, saveChatConditional } from '../../../../script.js';
-import { extension_settings, renderExtensionTemplateAsync, saveSettingsDebounced } from '../../../../scripts/extensions.js';
 
-const EXT_NAME = 'third-party/sillytavern-video-support';
 const SETTINGS_KEY = 'videoSupport';
+
+// Dynamic import — extensions.js path varies and static import kills the module silently
+let extension_settings, saveSettingsDebounced;
+async function loadExtensionAPIs() {
+    // Try multiple known paths for extensions.js
+    const paths = [
+        '../../../extensions.js',
+        '../../../../scripts/extensions.js',
+        '../../extensions.js',
+    ];
+    for (const path of paths) {
+        try {
+            const mod = await import(path);
+            extension_settings = mod.extension_settings;
+            saveSettingsDebounced = mod.saveSettingsDebounced;
+            console.debug('[VideoSupport] Loaded extensions.js from', path);
+            return;
+        } catch { /* try next */ }
+    }
+    console.warn('[VideoSupport] Could not load extensions.js — settings will not persist across sessions');
+    extension_settings = {};
+    saveSettingsDebounced = () => {};
+}
 
 const DEFAULTS = {
     mode: 'frontend',
@@ -325,6 +346,59 @@ function createAttachUI() {
 }
 
 // ---------------------------------------------------------------------------
+// Settings UI — loaded inline to avoid renderExtensionTemplateAsync dependency
+// ---------------------------------------------------------------------------
+
+function createSettingsUI() {
+    const html = `
+    <div class="video-support-settings">
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>Video Support</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <div class="video-support-setting">
+                    <label for="video_support_mode">Processing Mode</label>
+                    <select id="video_support_mode" class="text_pole">
+                        <option value="backend">Backend (send raw video)</option>
+                        <option value="frontend">Frontend (extract frames)</option>
+                    </select>
+                    <small class="video-support-hint">
+                        Backend sends the video file for the server to decode.
+                        Frontend extracts JPEG frames in the browser and sends them as images.
+                    </small>
+                </div>
+                <div id="video_support_frontend_options" style="display:none;">
+                    <hr>
+                    <div class="video-support-setting">
+                        <label for="video_support_fps">Frames per second</label>
+                        <input type="number" id="video_support_fps" class="text_pole" min="0.5" max="30" step="0.5" />
+                        <small class="video-support-hint">Lower = fewer frames, faster. 2 recommended.</small>
+                    </div>
+                    <div class="video-support-setting">
+                        <label for="video_support_max_dimension">Max frame dimension (px)</label>
+                        <input type="number" id="video_support_max_dimension" class="text_pole" min="128" max="2048" step="64" />
+                        <small class="video-support-hint">Longest side of each frame.</small>
+                    </div>
+                    <div class="video-support-setting">
+                        <label for="video_support_max_frames">Max frames</label>
+                        <input type="number" id="video_support_max_frames" class="text_pole" min="1" max="512" step="1" />
+                    </div>
+                    <div class="video-support-setting">
+                        <label for="video_support_jpeg_quality">JPEG quality</label>
+                        <input type="number" id="video_support_jpeg_quality" class="text_pole" min="0.1" max="1.0" step="0.05" />
+                        <small class="video-support-hint">0.1 = smallest, 1.0 = best quality. 0.7 is a good balance.</small>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>`;
+
+    $('#extensions_settings2').append(html);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -348,12 +422,11 @@ function formatBytes(n) {
 // ---------------------------------------------------------------------------
 
 jQuery(async () => {
+    await loadExtensionAPIs();
     loadSettings();
     patchFetch();
     createAttachUI();
-
-    const html = await renderExtensionTemplateAsync(EXT_NAME, 'settings');
-    $('#extensions_settings2').append(html);
+    createSettingsUI();
     applySettingsToUI();
     bindSettingsEvents();
 
