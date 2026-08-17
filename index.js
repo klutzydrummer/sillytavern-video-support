@@ -114,17 +114,21 @@ let fetchPatched = false;
 // ---------------------------------------------------------------------------
 
 /**
- * Extract JPEG frames from a video data URL using <video> + <canvas>.
+ * Extract JPEG frames from a video data URL.
+ * Uses WebGL to sample the video as a texture, which handles GPU→CPU
+ * readback correctly even when the browser uses hardware-accelerated
+ * video decode (canvas 2D drawImage often returns black in that case).
  * Returns an array of base64 data URL strings.
  */
 async function extractFrames(videoDataUrl) {
     const { fps, maxDimension, maxFrames, jpegQuality } = settings();
 
+    // --- set up video element (in DOM so compositor is active) ---
     const video = document.createElement('video');
     video.muted = true;
     video.playsInline = true;
     video.preload = 'auto';
-    video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+    video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;pointer-events:none;';
     video.src = videoDataUrl;
     document.body.appendChild(video);
 
@@ -136,62 +140,62 @@ async function extractFrames(videoDataUrl) {
 
         const duration = video.duration;
         const interval = 1 / fps;
-        const totalPossible = Math.floor(duration * fps);
-        const frameCount = Math.min(totalPossible, maxFrames);
+        const frameCount = Math.min(Math.floor(duration * fps), maxFrames);
 
         if (frameCount <= 0) {
             console.warn('[VideoSupport] No frames to extract');
             return [];
         }
 
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-
         const scale = Math.min(1, maxDimension / Math.max(video.videoWidth, video.videoHeight));
-        canvas.width = Math.round(video.videoWidth * scale);
-        canvas.height = Math.round(video.videoHeight * scale);
+        const w = Math.round(video.videoWidth * scale);
+        const h = Math.round(video.videoHeight * scale);
 
-        // Play the video at max speed and capture frames at the right
-        // timestamps. This avoids seeking entirely — seeking is the root
-        // cause of black frames because the decoder doesn't always produce
-        // a frame on seek for non-keyframe positions.
+        // --- set up WebGL capture ---
+        const glCanvas = document.createElement('canvas');
+        glCanvas.width = w;
+        glCanvas.height = h;
+        const gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer: true });
+        if (!gl) throw new Error('WebGL2 not available');
+
+        const program = createCaptureProgram(gl);
+        const tex = gl.createTexture();
+
+        // --- 2D canvas for JPEG encoding (toDataURL on WebGL is slow/limited) ---
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = w;
+        outCanvas.height = h;
+        const ctx2d = outCanvas.getContext('2d');
+
+        // --- extract frames by seeking ---
         const frames = [];
-        const targetTimes = Array.from({ length: frameCount }, (_, i) => i * interval);
+        for (let i = 0; i < frameCount; i++) {
+            video.currentTime = i * interval;
+            await new Promise((r) => { video.onseeked = r; });
 
-        await new Promise((resolve) => {
-            let idx = 0;
-            video.playbackRate = 16; // fast as possible
+            // Upload video as texture — WebGL reads from GPU regardless of decode path
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
 
-            function onFrame() {
-                if (idx >= targetTimes.length) {
-                    video.pause();
-                    resolve();
-                    return;
-                }
-                if (video.currentTime >= targetTimes[idx]) {
-                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                    frames.push(canvas.toDataURL('image/jpeg', jpegQuality));
-                    idx++;
-                }
-                if ('requestVideoFrameCallback' in video) {
-                    video.requestVideoFrameCallback(onFrame);
-                } else {
-                    requestAnimationFrame(onFrame);
-                }
-            }
+            // Draw fullscreen quad
+            gl.viewport(0, 0, w, h);
+            gl.useProgram(program);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-            video.currentTime = 0;
-            video.onseeked = () => {
-                if ('requestVideoFrameCallback' in video) {
-                    video.requestVideoFrameCallback(onFrame);
-                } else {
-                    requestAnimationFrame(onFrame);
-                }
-                video.play();
-            };
-        });
+            // Read back via 2D canvas for efficient JPEG encoding
+            ctx2d.drawImage(glCanvas, 0, 0);
+            frames.push(outCanvas.toDataURL('image/jpeg', jpegQuality));
+        }
 
-        console.debug(`[VideoSupport] Extracted ${frames.length} frames (${canvas.width}x${canvas.height}, ${fps} fps, q=${jpegQuality})`);
+        // Cleanup GL
+        gl.deleteTexture(tex);
+        gl.deleteProgram(program);
+
+        console.debug(`[VideoSupport] Extracted ${frames.length} frames (${w}x${h}, ${fps} fps, q=${jpegQuality})`);
         return frames;
     } finally {
         video.pause();
@@ -199,9 +203,51 @@ async function extractFrames(videoDataUrl) {
         video.load();
         video.remove();
     }
+}
 
-    console.debug(`[VideoSupport] Extracted ${frames.length} frames (${canvas.width}x${canvas.height}, ${fps} fps, q=${jpegQuality})`);
-    return frames;
+/**
+ * Create a minimal WebGL2 program that draws a fullscreen quad textured
+ * from sampler 0. The vertex shader generates positions and UVs from
+ * gl_VertexID so no vertex buffer is needed.
+ */
+function createCaptureProgram(gl) {
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, `#version 300 es
+        void main() {
+            // fullscreen quad from vertex ID: 0→(-1,-1) 1→(1,-1) 2→(-1,1) 3→(1,1)
+            vec2 pos = vec2(gl_VertexID & 1, (gl_VertexID >> 1) & 1) * 2.0 - 1.0;
+            gl_Position = vec4(pos, 0.0, 1.0);
+        }
+    `);
+    gl.compileShader(vs);
+
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, `#version 300 es
+        precision mediump float;
+        uniform sampler2D uTex;
+        out vec4 outColor;
+        void main() {
+            // flip Y — video texture is top-down, GL is bottom-up
+            vec2 uv = gl_FragCoord.xy / vec2(textureSize(uTex, 0));
+            uv.y = 1.0 - uv.y;
+            outColor = texture(uTex, uv);
+        }
+    `);
+    gl.compileShader(fs);
+
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+
+    // Bind sampler to unit 0
+    gl.useProgram(prog);
+    gl.uniform1i(gl.getUniformLocation(prog, 'uTex'), 0);
+
+    return prog;
 }
 
 // ---------------------------------------------------------------------------
