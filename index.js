@@ -157,12 +157,25 @@ async function extractFrames(videoDataUrl) {
         video.currentTime = i * interval;
         await new Promise((resolve) => { video.onseeked = resolve; });
 
-        // createImageBitmap waits for the frame to actually decode —
-        // without it, drawImage often captures a black frame on some codecs
-        const bitmap = await createImageBitmap(video);
-        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-        bitmap.close();
+        // Seek alone doesn't force frame decode on many codecs.
+        // Briefly play + requestVideoFrameCallback guarantees the
+        // compositor has an actual frame before we draw.
+        if ('requestVideoFrameCallback' in video) {
+            await new Promise((resolve) => {
+                video.requestVideoFrameCallback(() => {
+                    video.pause();
+                    resolve();
+                });
+                video.play();
+            });
+        } else {
+            // Fallback: play briefly and wait for decoder to catch up
+            video.play();
+            await new Promise((r) => setTimeout(r, 150));
+            video.pause();
+        }
 
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         frames.push(canvas.toDataURL('image/jpeg', jpegQuality));
     }
 
