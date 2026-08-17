@@ -1,19 +1,83 @@
 /**
- * SillyTavern Video Support Extension for llama.cpp
+ * SillyTavern Video Support Extension
  *
- * ST's OpenAI-compat pipeline skips video for custom backends
- * (videoInlining=false, default: return false). This extension bridges that:
+ * Two processing modes:
+ *   Backend  — sends the raw video as input_video for the server to decode
+ *   Frontend — extracts JPEG frames in the browser via <video>+<canvas>,
+ *              sends them as a sequence of image_url parts
  *
- *  - extra.media (ST's native format) stores the video — ST handles
- *    persistence, chat saving, and rendering the preview automatically
- *  - fetch rewrite injects input_video into the API payload:
- *    reads pendingVideo for the current send (no MESSAGE_SENT race),
- *    falls back to extra.media on the last user message for regeneration
- *  - pendingVideo is cleared in MESSAGE_SENT after persisting to extra.media,
- *    NOT in the fetch rewrite, so it stays available for the generation fetch
+ * Video is stored in extra.media (ST's native format) for persistence.
+ * The fetch rewrite reads pendingVideo (current send) or extra.media
+ * (regeneration) and injects the appropriate content parts.
  */
 
 import { chat, eventSource, event_types, saveChatConditional } from '../../../../script.js';
+import { extension_settings, renderExtensionTemplateAsync, saveSettingsDebounced } from '../../../extensions.js';
+
+const EXT_NAME = 'third-party/sillytavern-video-support';
+const SETTINGS_KEY = 'videoSupport';
+
+const DEFAULTS = {
+    mode: 'frontend',
+    fps: 2,
+    maxDimension: 512,
+    maxFrames: 128,
+    jpegQuality: 0.7,
+};
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+function settings() {
+    return extension_settings[SETTINGS_KEY];
+}
+
+function loadSettings() {
+    if (!extension_settings[SETTINGS_KEY]) extension_settings[SETTINGS_KEY] = {};
+    for (const [k, v] of Object.entries(DEFAULTS)) {
+        if (extension_settings[SETTINGS_KEY][k] === undefined) {
+            extension_settings[SETTINGS_KEY][k] = v;
+        }
+    }
+}
+
+function applySettingsToUI() {
+    $('#video_support_mode').val(settings().mode);
+    $('#video_support_fps').val(settings().fps);
+    $('#video_support_max_dimension').val(settings().maxDimension);
+    $('#video_support_max_frames').val(settings().maxFrames);
+    $('#video_support_jpeg_quality').val(settings().jpegQuality);
+    toggleFrontendOptions();
+}
+
+function toggleFrontendOptions() {
+    $('#video_support_frontend_options').toggle(settings().mode === 'frontend');
+}
+
+function bindSettingsEvents() {
+    $('#video_support_mode').on('change', function () {
+        settings().mode = $(this).val();
+        saveSettingsDebounced();
+        toggleFrontendOptions();
+    });
+    $('#video_support_fps').on('input', function () {
+        settings().fps = Math.max(0.5, Math.min(30, Number($(this).val())));
+        saveSettingsDebounced();
+    });
+    $('#video_support_max_dimension').on('input', function () {
+        settings().maxDimension = Math.max(128, Math.min(2048, Number($(this).val())));
+        saveSettingsDebounced();
+    });
+    $('#video_support_max_frames').on('input', function () {
+        settings().maxFrames = Math.max(1, Math.min(512, Number($(this).val())));
+        saveSettingsDebounced();
+    });
+    $('#video_support_jpeg_quality').on('input', function () {
+        settings().jpegQuality = Math.max(0.1, Math.min(1.0, Number($(this).val())));
+        saveSettingsDebounced();
+    });
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -23,6 +87,61 @@ import { chat, eventSource, event_types, saveChatConditional } from '../../../..
 let pendingVideo = null;
 
 let fetchPatched = false;
+
+// ---------------------------------------------------------------------------
+// Frame extraction (frontend mode)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract JPEG frames from a video data URL using <video> + <canvas>.
+ * Returns an array of base64 data URL strings.
+ */
+async function extractFrames(videoDataUrl) {
+    const { fps, maxDimension, maxFrames, jpegQuality } = settings();
+
+    const video = document.createElement('video');
+    video.muted = true;
+    video.preload = 'auto';
+    video.src = videoDataUrl;
+
+    await new Promise((resolve, reject) => {
+        video.onloadedmetadata = resolve;
+        video.onerror = () => reject(new Error('Failed to load video for frame extraction'));
+    });
+
+    // Ensure video data is buffered
+    if (video.readyState < 2) {
+        await new Promise((resolve) => { video.oncanplay = resolve; });
+    }
+
+    const duration = video.duration;
+    const interval = 1 / fps;
+    const totalPossible = Math.floor(duration * fps);
+    const frameCount = Math.min(totalPossible, maxFrames);
+
+    if (frameCount <= 0) {
+        console.warn('[VideoSupport] No frames to extract (duration too short or FPS too low)');
+        return [];
+    }
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    const scale = Math.min(1, maxDimension / Math.max(video.videoWidth, video.videoHeight));
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+
+    const frames = [];
+    for (let i = 0; i < frameCount; i++) {
+        video.currentTime = i * interval;
+        await new Promise((resolve) => { video.onseeked = resolve; });
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        frames.push(canvas.toDataURL('image/jpeg', jpegQuality));
+    }
+
+    console.debug(`[VideoSupport] Extracted ${frames.length} frames (${canvas.width}x${canvas.height}, ${fps} fps, q=${jpegQuality})`);
+    return frames;
+}
 
 // ---------------------------------------------------------------------------
 // fetch() patch
@@ -41,11 +160,17 @@ function patchFetch() {
             typeof url === 'string' &&
             isGenerationRequest(url)
         ) {
-            // pendingVideo for current send; extra.media for regeneration
             const videoUrl = pendingVideo?.dataUrl ?? getVideoFromLastUserMessage();
             if (videoUrl) {
                 try {
-                    options = injectInputVideo(options, videoUrl);
+                    if (settings().mode === 'frontend') {
+                        const frames = await extractFrames(videoUrl);
+                        if (frames.length > 0) {
+                            options = injectFrames(options, frames);
+                        }
+                    } else {
+                        options = injectInputVideo(options, videoUrl);
+                    }
                 } catch (err) {
                     console.error('[VideoSupport] Failed to inject video:', err);
                 }
@@ -69,27 +194,53 @@ function getVideoFromLastUserMessage() {
     return null;
 }
 
+/** Backend mode: inject raw video as input_video. */
 function injectInputVideo(options, videoUrl) {
     const body = JSON.parse(options.body);
     if (!Array.isArray(body.messages)) return options;
 
-    let targetIdx = -1;
-    for (let i = body.messages.length - 1; i >= 0; i--) {
-        if (body.messages[i].role === 'user') { targetIdx = i; break; }
-    }
-    if (targetIdx === -1) return options;
-
-    const msg = body.messages[targetIdx];
-    if (typeof msg.content === 'string') {
-        msg.content = [{ type: 'text', text: msg.content }];
-    } else if (!Array.isArray(msg.content)) {
-        msg.content = [];
-    }
+    const msg = findLastUserMessage(body.messages);
+    if (!msg) return options;
 
     msg.content.push({ type: 'input_video', input_video: { url: videoUrl } });
-    console.debug('[VideoSupport] Injected input_video into API payload');
+    console.debug('[VideoSupport] Injected input_video (backend mode)');
 
     return { ...options, body: JSON.stringify(body) };
+}
+
+/** Frontend mode: inject extracted frames as image_url parts. */
+function injectFrames(options, frames) {
+    const body = JSON.parse(options.body);
+    if (!Array.isArray(body.messages)) return options;
+
+    const msg = findLastUserMessage(body.messages);
+    if (!msg) return options;
+
+    for (const frame of frames) {
+        msg.content.push({ type: 'image_url', image_url: { url: frame } });
+    }
+    console.debug(`[VideoSupport] Injected ${frames.length} frames (frontend mode)`);
+
+    return { ...options, body: JSON.stringify(body) };
+}
+
+/**
+ * Find the last user message and normalise its content to an array.
+ * Returns the message object, or null if not found.
+ */
+function findLastUserMessage(messages) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+            const msg = messages[i];
+            if (typeof msg.content === 'string') {
+                msg.content = [{ type: 'text', text: msg.content }];
+            } else if (!Array.isArray(msg.content)) {
+                msg.content = [];
+            }
+            return msg;
+        }
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,17 +261,15 @@ async function onMessageSent(messageId) {
         console.debug('[VideoSupport] Saved video to message', messageId);
     }
 
-    // Clear only after persisting — the generation fetch fires before this
-    // and reads pendingVideo directly, so clearing here is safe
     pendingVideo = null;
     $('#video_support_indicator').hide();
 }
 
 // ---------------------------------------------------------------------------
-// UI
+// UI — attach button + indicator
 // ---------------------------------------------------------------------------
 
-function createUI() {
+function createAttachUI() {
     const fileInput = $('<input>', {
         type: 'file',
         accept: 'video/*',
@@ -130,7 +279,7 @@ function createUI() {
     $('body').append(fileInput);
 
     const btn = $(`
-        <div id="video_support_btn" class="list-group-item flex-container flexGap5" title="Attach video (llama.cpp)">
+        <div id="video_support_btn" class="list-group-item flex-container flexGap5" title="Attach video">
             <i class="fa-solid fa-film extensionsMenuExtensionButton"></i>
             <span>Attach Video</span>
         </div>
@@ -199,8 +348,15 @@ function formatBytes(n) {
 // ---------------------------------------------------------------------------
 
 jQuery(async () => {
+    loadSettings();
     patchFetch();
-    createUI();
+    createAttachUI();
+
+    const html = await renderExtensionTemplateAsync(EXT_NAME, 'settings');
+    $('#extensions_settings2').append(html);
+    applySettingsToUI();
+    bindSettingsEvents();
+
     eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
     console.log('[VideoSupport] Loaded');
 });

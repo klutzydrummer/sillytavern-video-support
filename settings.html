@@ -1,0 +1,56 @@
+<div class="video-support-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Video Support (llama.cpp)</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="video-support-setting">
+                <label for="video_support_mode">Processing Mode</label>
+                <select id="video_support_mode" class="text_pole">
+                    <option value="backend">Backend (send raw video)</option>
+                    <option value="frontend">Frontend (extract frames)</option>
+                </select>
+                <small class="video-support-hint">
+                    Backend sends the video file for the server to decode.
+                    Frontend extracts JPEG frames in the browser and sends them as images.
+                </small>
+            </div>
+
+            <div id="video_support_frontend_options" style="display:none;">
+                <hr>
+                <div class="video-support-setting">
+                    <label for="video_support_fps">Frames per second</label>
+                    <input type="number" id="video_support_fps" class="text_pole" min="0.5" max="30" step="0.5" />
+                    <small class="video-support-hint">
+                        Lower = fewer frames, faster. 2 is recommended for general understanding.
+                    </small>
+                </div>
+
+                <div class="video-support-setting">
+                    <label for="video_support_max_dimension">Max frame dimension (px)</label>
+                    <input type="number" id="video_support_max_dimension" class="text_pole" min="128" max="2048" step="64" />
+                    <small class="video-support-hint">
+                        Longest side of each frame. Smaller = less tokens per frame.
+                    </small>
+                </div>
+
+                <div class="video-support-setting">
+                    <label for="video_support_max_frames">Max frames</label>
+                    <input type="number" id="video_support_max_frames" class="text_pole" min="1" max="512" step="1" />
+                    <small class="video-support-hint">
+                        Hard cap on total extracted frames.
+                    </small>
+                </div>
+
+                <div class="video-support-setting">
+                    <label for="video_support_jpeg_quality">JPEG quality</label>
+                    <input type="number" id="video_support_jpeg_quality" class="text_pole" min="0.1" max="1.0" step="0.05" />
+                    <small class="video-support-hint">
+                        0.1 = smallest files, 1.0 = best quality. 0.7 is a good balance.
+                    </small>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>

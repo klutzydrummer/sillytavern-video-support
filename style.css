@@ -56,3 +56,28 @@
     margin-top: 6px;
     border-radius: 6px;
 }
+
+/* Settings panel */
+
+.video-support-settings .inline-drawer-content {
+    padding: 8px 0;
+}
+
+.video-support-setting {
+    margin-bottom: 10px;
+}
+
+.video-support-setting label {
+    display: block;
+    margin-bottom: 3px;
+    font-weight: 600;
+    font-size: 0.9em;
+}
+
+.video-support-hint {
+    display: block;
+    margin-top: 2px;
+    opacity: 0.6;
+    font-size: 0.8em;
+    line-height: 1.3;
+}
