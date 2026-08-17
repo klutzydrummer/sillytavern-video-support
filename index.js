@@ -170,7 +170,7 @@ async function extractFrames(videoDataUrl) {
             const name = `frame_${String(i).padStart(4, '0')}.jpg`;
             try {
                 const data = await ffmpeg.readFile(name);
-                const blob = new Blob([data.buffer], { type: 'image/jpeg' });
+                const blob = new Blob([data], { type: 'image/jpeg' });
                 frames.push(await blobToDataUrl(blob));
                 // Clean up file
                 await ffmpeg.deleteFile(name);
