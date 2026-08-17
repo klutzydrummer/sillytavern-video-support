@@ -114,140 +114,102 @@ let fetchPatched = false;
 // ---------------------------------------------------------------------------
 
 /**
- * Extract JPEG frames from a video data URL.
- * Uses WebGL to sample the video as a texture, which handles GPU→CPU
- * readback correctly even when the browser uses hardware-accelerated
- * video decode (canvas 2D drawImage often returns black in that case).
+ * Extract JPEG frames from a video data URL using ffmpeg.wasm.
+ * Runs ffmpeg entirely in the browser via WebAssembly — handles all
+ * codecs correctly with no GPU/hardware decode issues.
  * Returns an array of base64 data URL strings.
  */
+
+let ffmpegInstance = null;
+
+async function getFFmpeg() {
+    if (ffmpegInstance?.loaded) return ffmpegInstance;
+
+    const { FFmpeg } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm');
+    const { toBlobURL } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/+esm');
+
+    const ffmpeg = new FFmpeg();
+    const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.9/dist/esm';
+    await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+    });
+
+    ffmpegInstance = ffmpeg;
+    console.debug('[VideoSupport] ffmpeg.wasm loaded');
+    return ffmpeg;
+}
+
 async function extractFrames(videoDataUrl) {
     const { fps, maxDimension, maxFrames, jpegQuality } = settings();
 
-    // --- set up video element (in DOM so compositor is active) ---
-    const video = document.createElement('video');
-    video.muted = true;
-    video.playsInline = true;
-    video.preload = 'auto';
-    video.style.cssText = 'position:fixed;top:-9999px;left:-9999px;pointer-events:none;';
-    video.src = videoDataUrl;
-    document.body.appendChild(video);
+    toastr.info('Extracting frames with ffmpeg...', 'Video Support', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: true });
 
     try {
-        await new Promise((resolve, reject) => {
-            video.onloadeddata = resolve;
-            video.onerror = () => reject(new Error('Failed to load video'));
-        });
+        const ffmpeg = await getFFmpeg();
 
-        const duration = video.duration;
-        const interval = 1 / fps;
-        const frameCount = Math.min(Math.floor(duration * fps), maxFrames);
+        // Write video to virtual filesystem
+        const videoBytes = dataUrlToUint8Array(videoDataUrl);
+        await ffmpeg.writeFile('input.mp4', videoBytes);
 
-        if (frameCount <= 0) {
-            console.warn('[VideoSupport] No frames to extract');
-            return [];
-        }
+        // Map JPEG quality: our 0-1 scale → ffmpeg qscale 1-31 (lower = better)
+        const qscale = Math.max(1, Math.round((1 - jpegQuality) * 30 + 1));
 
-        const scale = Math.min(1, maxDimension / Math.max(video.videoWidth, video.videoHeight));
-        const w = Math.round(video.videoWidth * scale);
-        const h = Math.round(video.videoHeight * scale);
+        // Extract frames
+        await ffmpeg.exec([
+            '-i', 'input.mp4',
+            '-vf', `fps=${fps},scale=${maxDimension}:-2`,
+            '-frames:v', String(maxFrames),
+            '-q:v', String(qscale),
+            'frame_%04d.jpg',
+        ]);
 
-        // --- set up WebGL capture ---
-        const glCanvas = document.createElement('canvas');
-        glCanvas.width = w;
-        glCanvas.height = h;
-        const gl = glCanvas.getContext('webgl2', { preserveDrawingBuffer: true });
-        if (!gl) throw new Error('WebGL2 not available');
-
-        const program = createCaptureProgram(gl);
-        const tex = gl.createTexture();
-
-        // --- 2D canvas for JPEG encoding (toDataURL on WebGL is slow/limited) ---
-        const outCanvas = document.createElement('canvas');
-        outCanvas.width = w;
-        outCanvas.height = h;
-        const ctx2d = outCanvas.getContext('2d');
-
-        // --- extract frames by seeking ---
+        // Read output frames
         const frames = [];
-        for (let i = 0; i < frameCount; i++) {
-            video.currentTime = i * interval;
-            await new Promise((r) => { video.onseeked = r; });
-
-            // Upload video as texture — WebGL reads from GPU regardless of decode path
-            gl.activeTexture(gl.TEXTURE0);
-            gl.bindTexture(gl.TEXTURE_2D, tex);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-
-            // Draw fullscreen quad
-            gl.viewport(0, 0, w, h);
-            gl.useProgram(program);
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-            // Read back via 2D canvas for efficient JPEG encoding
-            ctx2d.drawImage(glCanvas, 0, 0);
-            frames.push(outCanvas.toDataURL('image/jpeg', jpegQuality));
+        for (let i = 1; i <= maxFrames; i++) {
+            const name = `frame_${String(i).padStart(4, '0')}.jpg`;
+            try {
+                const data = await ffmpeg.readFile(name);
+                const blob = new Blob([data.buffer], { type: 'image/jpeg' });
+                frames.push(await blobToDataUrl(blob));
+                // Clean up file
+                await ffmpeg.deleteFile(name);
+            } catch {
+                break; // no more frames
+            }
         }
 
-        // Cleanup GL
-        gl.deleteTexture(tex);
-        gl.deleteProgram(program);
+        // Clean up input
+        await ffmpeg.deleteFile('input.mp4');
 
-        console.debug(`[VideoSupport] Extracted ${frames.length} frames (${w}x${h}, ${fps} fps, q=${jpegQuality})`);
+        console.debug(`[VideoSupport] Extracted ${frames.length} frames (${fps} fps, q=${jpegQuality})`);
+        toastr.clear();
+        toastr.success(`Extracted ${frames.length} frames`, 'Video Support');
         return frames;
-    } finally {
-        video.pause();
-        video.removeAttribute('src');
-        video.load();
-        video.remove();
+    } catch (err) {
+        toastr.clear();
+        toastr.error(`Frame extraction failed: ${err.message}`, 'Video Support');
+        throw err;
     }
 }
 
-/**
- * Create a minimal WebGL2 program that draws a fullscreen quad textured
- * from sampler 0. The vertex shader generates positions and UVs from
- * gl_VertexID so no vertex buffer is needed.
- */
-function createCaptureProgram(gl) {
-    const vs = gl.createShader(gl.VERTEX_SHADER);
-    gl.shaderSource(vs, `#version 300 es
-        void main() {
-            // fullscreen quad from vertex ID: 0→(-1,-1) 1→(1,-1) 2→(-1,1) 3→(1,1)
-            vec2 pos = vec2(gl_VertexID & 1, (gl_VertexID >> 1) & 1) * 2.0 - 1.0;
-            gl_Position = vec4(pos, 0.0, 1.0);
-        }
-    `);
-    gl.compileShader(vs);
+function dataUrlToUint8Array(dataUrl) {
+    const base64 = dataUrl.split(',')[1];
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+}
 
-    const fs = gl.createShader(gl.FRAGMENT_SHADER);
-    gl.shaderSource(fs, `#version 300 es
-        precision mediump float;
-        uniform sampler2D uTex;
-        out vec4 outColor;
-        void main() {
-            // flip Y — video texture is top-down, GL is bottom-up
-            vec2 uv = gl_FragCoord.xy / vec2(textureSize(uTex, 0));
-            uv.y = 1.0 - uv.y;
-            outColor = texture(uTex, uv);
-        }
-    `);
-    gl.compileShader(fs);
-
-    const prog = gl.createProgram();
-    gl.attachShader(prog, vs);
-    gl.attachShader(prog, fs);
-    gl.linkProgram(prog);
-
-    gl.deleteShader(vs);
-    gl.deleteShader(fs);
-
-    // Bind sampler to unit 0
-    gl.useProgram(prog);
-    gl.uniform1i(gl.getUniformLocation(prog, 'uTex'), 0);
-
-    return prog;
+function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+    });
 }
 
 // ---------------------------------------------------------------------------
