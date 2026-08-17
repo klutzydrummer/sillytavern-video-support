@@ -130,9 +130,11 @@ async function getFFmpeg() {
 
     const ffmpeg = new FFmpeg();
     const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.9/dist/esm';
+    const workerURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/worker.js';
     await ffmpeg.load({
         coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
         wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        workerURL: await toBlobURL(workerURL, 'text/javascript'),
     });
 
     ffmpegInstance = ffmpeg;
@@ -150,6 +152,7 @@ async function extractFrames(videoDataUrl) {
 
         // Write video to virtual filesystem
         const videoBytes = dataUrlToUint8Array(videoDataUrl);
+        console.debug(`[VideoSupport] Input video: ${videoBytes.byteLength} bytes, first 4 bytes: ${Array.from(videoBytes.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
         await ffmpeg.writeFile('input.mp4', videoBytes);
 
         // Map JPEG quality: our 0-1 scale → ffmpeg qscale 1-31 (lower = better)
@@ -170,9 +173,20 @@ async function extractFrames(videoDataUrl) {
             const name = `frame_${String(i).padStart(4, '0')}.jpg`;
             try {
                 const data = await ffmpeg.readFile(name);
+                console.debug(`[VideoSupport] Frame ${i}: ${data.byteLength} bytes`);
                 const blob = new Blob([data], { type: 'image/jpeg' });
-                frames.push(await blobToDataUrl(blob));
-                // Clean up file
+                const dataUrl = await blobToDataUrl(blob);
+                frames.push(dataUrl);
+                // Show first frame as visual debug
+                if (i === 1) {
+                    const img = document.createElement('img');
+                    img.src = dataUrl;
+                    img.style.cssText = 'position:fixed;top:10px;right:10px;z-index:99999;max-width:200px;border:3px solid red;';
+                    img.title = 'Debug: first extracted frame (click to dismiss)';
+                    img.onclick = () => img.remove();
+                    document.body.appendChild(img);
+                    console.debug(`[VideoSupport] Frame 1 data URL length: ${dataUrl.length}`);
+                }
                 await ffmpeg.deleteFile(name);
             } catch {
                 break; // no more frames
