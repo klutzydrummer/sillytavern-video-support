@@ -12,7 +12,7 @@
  */
 
 import { chat, eventSource, event_types, saveChatConditional } from '../../../../script.js';
-import { extension_settings, renderExtensionTemplateAsync, saveSettingsDebounced } from '../../../extensions.js';
+import { extension_settings, renderExtensionTemplateAsync, saveSettingsDebounced } from '../../../../scripts/extensions.js';
 
 const EXT_NAME = 'third-party/sillytavern-video-support';
 const SETTINGS_KEY = 'videoSupport';
