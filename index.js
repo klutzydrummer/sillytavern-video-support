@@ -156,7 +156,13 @@ async function extractFrames(videoDataUrl) {
     for (let i = 0; i < frameCount; i++) {
         video.currentTime = i * interval;
         await new Promise((resolve) => { video.onseeked = resolve; });
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // createImageBitmap waits for the frame to actually decode —
+        // without it, drawImage often captures a black frame on some codecs
+        const bitmap = await createImageBitmap(video);
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        bitmap.close();
+
         frames.push(canvas.toDataURL('image/jpeg', jpegQuality));
     }
 
