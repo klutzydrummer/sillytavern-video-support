@@ -245,6 +245,44 @@ function blobToDataUrl(blob) {
 }
 
 // ---------------------------------------------------------------------------
+// Frame cache — swipes/regenerations re-send the same video repeatedly.
+// Skip re-extraction when the video and the extraction-relevant settings
+// haven't changed since the last run.
+// ---------------------------------------------------------------------------
+
+const FRAME_CACHE_MAX_ENTRIES = 5;
+/** @type {Map<string, { signature: string, frames: string[] }>} */
+const frameCache = new Map();
+
+function extractionSignature() {
+    const { fps, maxDimension, maxFrames, jpegQuality } = settings();
+    return JSON.stringify({ fps, maxDimension, maxFrames, jpegQuality });
+}
+
+/** Returns cached frames for this video if the extraction settings still match, otherwise re-extracts. */
+async function getFramesForVideo(videoUrl) {
+    const signature = extractionSignature();
+    const cached = frameCache.get(videoUrl);
+    if (cached && cached.signature === signature) {
+        console.debug(`[VideoSupport] Reusing ${cached.frames.length} cached frames (settings unchanged)`);
+        // Refresh recency for LRU eviction
+        frameCache.delete(videoUrl);
+        frameCache.set(videoUrl, cached);
+        return cached.frames;
+    }
+
+    const frames = await extractFrames(videoUrl);
+
+    frameCache.delete(videoUrl);
+    if (frameCache.size >= FRAME_CACHE_MAX_ENTRIES) {
+        frameCache.delete(frameCache.keys().next().value);
+    }
+    frameCache.set(videoUrl, { signature, frames });
+
+    return frames;
+}
+
+// ---------------------------------------------------------------------------
 // fetch() patch
 // ---------------------------------------------------------------------------
 
@@ -265,7 +303,7 @@ function patchFetch() {
             if (videoUrl) {
                 try {
                     if (settings().mode === 'frontend') {
-                        const frames = await extractFrames(videoUrl);
+                        const frames = await getFramesForVideo(videoUrl);
                         if (frames.length > 0) {
                             options = injectFrames(options, frames);
                         }
