@@ -11,7 +11,16 @@
  * (regeneration) and injects the appropriate content parts.
  */
 
-import { chat, eventSource, event_types, saveChatConditional } from '../../../../script.js';
+import { chat, eventSource, event_types, saveChatConditional, getRequestHeaders } from '../../../../script.js';
+import {
+    DEFAULT_CDN_BASE,
+    estimateTokens,
+    ffmpegAssetUrls,
+    formatTokenEstimate,
+    getOwnedVideoUrl,
+    isInjectableGenType,
+    isMainGenerateUrl,
+} from './video-utils.js';
 
 const SETTINGS_KEY = 'videoSupport';
 
@@ -40,10 +49,13 @@ async function loadExtensionAPIs() {
 
 const DEFAULTS = {
     mode: 'frontend',
-    fps: 2,
+    fps: 1,
     maxDimension: 512,
-    maxFrames: 128,
+    maxFrames: 24,
+    tokensPerFrame: 1024, // vastai-llmrunner models.json forces image min=max=1024 tokens
     jpegQuality: 0.7,
+    maxUploadMB: 50, // refuse videos larger than this (base64 inflates ~33% on the wire)
+    cdnBase: DEFAULT_CDN_BASE,
     debug: false,
 };
 
@@ -70,8 +82,17 @@ function applySettingsToUI() {
     $('#video_support_max_dimension').val(settings().maxDimension);
     $('#video_support_max_frames').val(settings().maxFrames);
     $('#video_support_jpeg_quality').val(settings().jpegQuality);
+    $('#video_support_tokens_per_frame').val(settings().tokensPerFrame);
+    $('#video_support_max_upload_mb').val(settings().maxUploadMB);
+    $('#video_support_cdn_base').val(settings().cdnBase);
     $('#video_support_debug').prop('checked', settings().debug);
     toggleFrontendOptions();
+    updateTokenEstimate();
+}
+
+function updateTokenEstimate() {
+    const { maxFrames, tokensPerFrame } = settings();
+    $('#video_support_token_estimate').text(formatTokenEstimate(maxFrames, tokensPerFrame));
 }
 
 function toggleFrontendOptions() {
@@ -85,7 +106,7 @@ function bindSettingsEvents() {
         toggleFrontendOptions();
     });
     $('#video_support_fps').on('input', function () {
-        settings().fps = Math.max(0.5, Math.min(30, Number($(this).val())));
+        settings().fps = Math.max(0.1, Math.min(30, Number($(this).val()) || DEFAULTS.fps));
         saveSettingsDebounced();
     });
     $('#video_support_max_dimension').on('input', function () {
@@ -93,7 +114,22 @@ function bindSettingsEvents() {
         saveSettingsDebounced();
     });
     $('#video_support_max_frames').on('input', function () {
-        settings().maxFrames = Math.max(1, Math.min(512, Number($(this).val())));
+        settings().maxFrames = Math.max(1, Math.min(512, Number($(this).val()) || DEFAULTS.maxFrames));
+        saveSettingsDebounced();
+        updateTokenEstimate();
+    });
+    $('#video_support_tokens_per_frame').on('input', function () {
+        settings().tokensPerFrame = Math.max(1, Math.min(16384, Number($(this).val()) || DEFAULTS.tokensPerFrame));
+        saveSettingsDebounced();
+        updateTokenEstimate();
+    });
+    $('#video_support_max_upload_mb').on('input', function () {
+        settings().maxUploadMB = Math.max(1, Math.min(2048, Number($(this).val()) || DEFAULTS.maxUploadMB));
+        saveSettingsDebounced();
+    });
+    $('#video_support_cdn_base').on('change', function () {
+        settings().cdnBase = String($(this).val()).trim() || DEFAULT_CDN_BASE;
+        ffmpegInstance = null; // reload from the new location
         saveSettingsDebounced();
     });
     $('#video_support_jpeg_quality').on('input', function () {
@@ -115,6 +151,10 @@ let pendingVideo = null;
 
 let fetchPatched = false;
 
+/** Type of the generation currently in flight (from GENERATION_STARTED); null = none/unknown. */
+let currentGenType = null;
+let currentGenDryRun = false;
+
 // ---------------------------------------------------------------------------
 // Frame extraction (frontend mode)
 // ---------------------------------------------------------------------------
@@ -131,12 +171,13 @@ let ffmpegInstance = null;
 async function getFFmpeg() {
     if (ffmpegInstance?.loaded) return ffmpegInstance;
 
-    const { FFmpeg } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/+esm');
-    const { toBlobURL } = await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.1/+esm');
+    const urls = ffmpegAssetUrls(settings().cdnBase);
+    const { FFmpeg } = await import(/* webpackIgnore: true */ urls.ffmpegModule);
+    const { toBlobURL } = await import(/* webpackIgnore: true */ urls.utilModule);
 
     const ffmpeg = new FFmpeg();
-    const coreBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.9/dist/esm';
-    const ffmpegBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm';
+    const coreBaseURL = urls.coreBase;
+    const ffmpegBaseURL = urls.ffmpegBase;
 
     // Fetch worker.js and rewrite relative imports to absolute URLs so it works as a blob Worker
     const workerSrc = await (await fetch(`${ffmpegBaseURL}/worker.js`)).text();
@@ -216,7 +257,7 @@ async function extractFrames(videoDataUrl) {
 
         console.debug(`[VideoSupport] Extracted ${frames.length} frames (${fps} fps, q=${jpegQuality})`);
         toastr.clear();
-        toastr.success(`Extracted ${frames.length} frames`, 'Video Support');
+        toastr.success(`Extracted ${frames.length} frames (~${estimateTokens(frames.length, settings().tokensPerFrame)} tokens)`, 'Video Support');
         return frames;
     } catch (err) {
         toastr.clear();
@@ -260,7 +301,7 @@ function extractionSignature() {
 }
 
 /** Returns cached frames for this video if the extraction settings still match, otherwise re-extracts. */
-async function getFramesForVideo(videoUrl) {
+async function getFramesForVideo(videoUrl, dataUrl = videoUrl) {
     const signature = extractionSignature();
     const cached = frameCache.get(videoUrl);
     if (cached && cached.signature === signature) {
@@ -271,7 +312,7 @@ async function getFramesForVideo(videoUrl) {
         return cached.frames;
     }
 
-    const frames = await extractFrames(videoUrl);
+    const frames = await extractFrames(dataUrl);
 
     frameCache.delete(videoUrl);
     if (frameCache.size >= FRAME_CACHE_MAX_ENTRIES) {
@@ -297,18 +338,22 @@ function patchFetch() {
             options.body &&
             typeof options.body === 'string' &&
             typeof url === 'string' &&
-            isGenerationRequest(url)
+            isMainGenerateUrl(url) &&
+            isInjectableGenType(currentGenType, currentGenDryRun) &&
+            isCustomSource(options.body)
         ) {
-            const videoUrl = pendingVideo?.dataUrl ?? getVideoFromLastUserMessage();
+            // pendingVideo = being sent right now; otherwise only a video owned by the newest user message
+            const videoUrl = pendingVideo?.dataUrl ?? getOwnedVideoUrl(chat);
             if (videoUrl) {
                 try {
+                    const dataUrl = await resolveVideoDataUrl(videoUrl);
                     if (settings().mode === 'frontend') {
-                        const frames = await getFramesForVideo(videoUrl);
+                        const frames = await getFramesForVideo(videoUrl, dataUrl);
                         if (frames.length > 0) {
                             options = injectFrames(options, frames);
                         }
                     } else {
-                        options = injectInputVideo(options, videoUrl);
+                        options = injectInputVideo(options, dataUrl);
                     }
                 } catch (err) {
                     console.error('[VideoSupport] Failed to inject video:', err);
@@ -317,20 +362,29 @@ function patchFetch() {
         }
         return originalFetch.call(this, url, options);
     };
+
+    // Resolve stored files through the unpatched fetch
+    originalFetchRef = originalFetch;
 }
 
-function isGenerationRequest(url) {
-    return url.includes('/generate') || url.includes('/chat/completions');
-}
+let originalFetchRef = null;
 
-function getVideoFromLastUserMessage() {
-    if (!Array.isArray(chat)) return null;
-    for (let i = chat.length - 1; i >= 0; i--) {
-        if (!chat[i].is_user) continue;
-        const video = chat[i].extra?.media?.find(m => m.type === 'video');
-        if (video?.url) return video.url;
+/** Only the Custom (OpenAI-compatible) source gets video; other chat-completion sources are left alone. */
+function isCustomSource(body) {
+    try {
+        const source = JSON.parse(body).chat_completion_source;
+        return source === undefined || source === 'custom';
+    } catch {
+        return false;
     }
-    return null;
+}
+
+/** Stored videos are uploaded files (URL path); convert back to a data URL for sending. Data URLs pass through. */
+async function resolveVideoDataUrl(url) {
+    if (url.startsWith('data:')) return url;
+    const res = await (originalFetchRef ?? window.fetch)(url);
+    if (!res.ok) throw new Error(`Could not read stored video (${res.status})`);
+    return blobToDataUrl(await res.blob());
 }
 
 /** Backend mode: inject raw video as input_video. */
@@ -395,13 +449,37 @@ async function onMessageSent(messageId) {
     if (msg) {
         if (!msg.extra) msg.extra = {};
         if (!Array.isArray(msg.extra.media)) msg.extra.media = [];
-        msg.extra.media.push({ type: 'video', url: dataUrl, title: fileName, source: 'upload' });
+        const url = await uploadVideo(dataUrl, fileName);
+        msg.extra.media.push({ type: 'video', url, title: fileName, source: 'upload' });
         await saveChatConditional();
         console.debug('[VideoSupport] Saved video to message', messageId);
     }
 
     pendingVideo = null;
     $('#video_support_indicator').hide();
+}
+
+/**
+ * Save the video via ST's file upload API so the chat JSONL stores a short path
+ * instead of megabytes of base64. Falls back to the inline data URL if the upload fails.
+ */
+async function uploadVideo(dataUrl, fileName) {
+    try {
+        const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const res = await fetch('/api/files/upload', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ name: `video_${Date.now()}_${safeName}`, data: dataUrl.split(',')[1] }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const { path } = await res.json();
+        if (!path) throw new Error('no path returned');
+        return path;
+    } catch (err) {
+        console.warn('[VideoSupport] Upload failed, storing inline in chat file:', err);
+        toastr.warning('Could not upload video file; storing it inline in the chat.', 'Video Support');
+        return dataUrl;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +523,12 @@ function createAttachUI() {
     fileInput.on('change', async (e) => {
         const file = e.target.files?.[0];
         if (!file) return;
+        const maxBytes = settings().maxUploadMB * 1048576;
+        if (file.size > maxBytes) {
+            toastr.error(`Video is ${formatBytes(file.size)}; limit is ${settings().maxUploadMB} MB (see Video Support settings).`, 'Video Support');
+            fileInput.val('');
+            return;
+        }
         try {
             pendingVideo = { dataUrl: await readAsDataUrl(file), fileName: file.name };
             $('#video_support_filename').text(file.name);
@@ -491,8 +575,8 @@ function createSettingsUI() {
                     <hr>
                     <div class="video-support-setting">
                         <label for="video_support_fps">Frames per second</label>
-                        <input type="number" id="video_support_fps" class="text_pole" min="0.5" max="30" step="0.5" />
-                        <small class="video-support-hint">Lower = fewer frames, faster. 2 recommended.</small>
+                        <input type="number" id="video_support_fps" class="text_pole" min="0.1" max="30" step="0.1" />
+                        <small class="video-support-hint">Lower = fewer frames, faster. 1 recommended.</small>
                     </div>
                     <div class="video-support-setting">
                         <label for="video_support_max_dimension">Max frame dimension (px)</label>
@@ -502,6 +586,12 @@ function createSettingsUI() {
                     <div class="video-support-setting">
                         <label for="video_support_max_frames">Max frames</label>
                         <input type="number" id="video_support_max_frames" class="text_pole" min="1" max="512" step="1" />
+                        <small class="video-support-hint">Hard cap. Context cost: <b id="video_support_token_estimate"></b></small>
+                    </div>
+                    <div class="video-support-setting">
+                        <label for="video_support_tokens_per_frame">Tokens per frame</label>
+                        <input type="number" id="video_support_tokens_per_frame" class="text_pole" min="1" max="16384" step="1" />
+                        <small class="video-support-hint">Used only for the estimate. 1024 matches vastai-llmrunner, which forces 1024 image tokens regardless of frame size. ST's own token counter does not see video frames.</small>
                     </div>
                     <div class="video-support-setting">
                         <label for="video_support_jpeg_quality">JPEG quality</label>
@@ -510,6 +600,16 @@ function createSettingsUI() {
                     </div>
                 </div>
                 <hr>
+                <div class="video-support-setting">
+                    <label for="video_support_max_upload_mb">Max video size (MB)</label>
+                    <input type="number" id="video_support_max_upload_mb" class="text_pole" min="1" max="2048" step="1" />
+                    <small class="video-support-hint">Larger files are refused. Videos are saved as ST uploaded files; backend mode sends the whole file (base64, +33%) through ST and any tunnel.</small>
+                </div>
+                <div class="video-support-setting">
+                    <label for="video_support_cdn_base">ffmpeg.wasm source (npm-layout base URL)</label>
+                    <input type="text" id="video_support_cdn_base" class="text_pole" />
+                    <small class="video-support-hint">Frontend mode downloads ffmpeg.wasm (~30 MB) from here on first use. Default is jsDelivr (needs browser internet). To avoid the CDN, self-host @ffmpeg/ffmpeg 0.12.15, @ffmpeg/util 0.12.1 and @ffmpeg/core 0.12.9 in an npm-style folder and point this at it. Reload ffmpeg by changing the value.</small>
+                </div>
                 <div class="video-support-setting">
                     <label class="checkbox_label" for="video_support_debug">
                         <input type="checkbox" id="video_support_debug" />
@@ -557,5 +657,12 @@ jQuery(async () => {
     bindSettingsEvents();
 
     eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+    eventSource.on(event_types.GENERATION_STARTED, (type, _params, dryRun) => {
+        currentGenType = type || 'normal';
+        currentGenDryRun = !!dryRun;
+    });
+    for (const ev of [event_types.GENERATION_ENDED, event_types.GENERATION_STOPPED]) {
+        eventSource.on(ev, () => { currentGenType = null; });
+    }
     console.log('[VideoSupport] Loaded');
 });

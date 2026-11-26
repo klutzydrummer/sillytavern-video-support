@@ -1,95 +1,56 @@
-# llama.cpp Video Support — Server Setup Primer
+# Video in SillyTavern with llama.cpp — Setup Primer
 
-## What the SillyTavern extension sends
+The extension has two modes. Both only touch the main chat generation request of the **Custom (OpenAI-compatible)** chat-completion source, and only for the user message that owns the video (including its regenerate/swipe). Later turns do not re-send it.
 
-The extension injects an `input_video` content part into the last user message before the request reaches the server. The request body looks like:
+| Mode | What is sent | Server needs |
+|---|---|---|
+| Frontend (default) | N JPEG frames as `image_url` parts, extracted in the browser with ffmpeg.wasm | Any vision model that accepts images (e.g. Gemma 4). No video support needed. |
+| Backend | One `input_video` part with a `data:video/mp4;base64,...` URI | llama.cpp build including **PR #27921** (server accepts video as `input_video`/`video_url` and data URIs), on top of mtmd video support (#24269), plus `ffmpeg`/`ffprobe` in the server's PATH |
 
 ```json
-{
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        { "type": "text", "text": "describe the video" },
-        {
-          "type": "input_video",
-          "input_video": { "url": "data:video/mp4;base64,AAAA..." }
-        }
-      ]
-    }
-  ]
-}
+{ "type": "image_url",   "image_url":   { "url": "data:image/jpeg;base64,..." } }
+{ "type": "input_video", "input_video": { "url": "data:video/mp4;base64,..." } }
 ```
 
-The video is sent as a base64-encoded data URI (`data:video/mp4;base64,...`). This is the format llama.cpp's mtmd subsystem expects.
+## Context cost (the important part)
 
----
+Context used = frames x tokens per frame.
 
-## Requirements
+- **Frontend mode:** frames = min(duration x fps, Max frames). Defaults are 1 fps and 24 frames max (~24.6k tokens at 1024/frame). The settings panel shows the worst-case estimate; "Tokens per frame" is only used for that estimate.
+- **Tokens per frame** depends on the server. With vastai-llmrunner, `models.json` forces `image_min_tokens = image_max_tokens = 1024`, so every frame costs 1024 tokens regardless of the "Max frame dimension" setting. For other servers set `--image-min-tokens`/`--image-max-tokens` (llama-server) lower to make frames cheaper (Gemma 4 guidance for video is small budgets, ~70–280 tokens/frame, and at most ~60 frames).
+- **Backend mode:** llama-server samples at `--video-fps` (default 4.0), i.e. roughly 4 x tokens-per-frame per second of video (about 4096 tokens/s at 1024). Pass `--video-fps 1` (or lower) when launching. The extension's fps/frame settings do not apply in this mode.
+- SillyTavern's own token counter does not see the video parts (they are added when the request is sent), so ST will not trim chat history to make room. Keep video budgets well under your context size.
 
-### 1. llama.cpp build
+## Audio
 
-Video support requires the **mtmd** (multimodal) subsystem, merged June 2026 (PR #24269). You need a build from that date or later. Confirm by checking startup logs for output mentioning `mtmd` or by verifying the build date.
+The extension does not extract or send audio. Frames and llama.cpp's video path carry images only. **LFM3-Omni** can use the video's soundtrack; whether it is used depends on the server stack receiving the video (backend mode with a runner that forwards audio). That path is not verified here.
 
-### 2. ffmpeg
+## Requirements (backend mode)
 
-llama.cpp delegates video decoding to ffmpeg as a subprocess. ffmpeg **must be installed and accessible in the PATH of the process running the llama.cpp server**. Verify:
+1. llama.cpp built after #27921 (2026-09-23). Check `llama-server --help` for `--video-fps`.
+2. `ffmpeg` and `ffprobe` on the PATH of the server process (systemd/containers may differ from your shell): `ffmpeg -version`.
+3. A vision-capable model plus its `--mmproj`.
 
 ```bash
-ffmpeg -version
+llama-server --model model.gguf --mmproj mmproj.gguf --video-fps 1 --host 0.0.0.0 --port 8080
 ```
 
-Run this in the same shell/environment as the server, not just your login shell — if the server runs as a systemd service or in a container, PATH may differ.
+Older builds reject `video_url`/`input_video` with HTTP 400; use frontend mode there.
 
-### 3. A video-capable multimodal model + mmproj
+## Size limits and storage
 
-Not all multimodal models support video. The model must have a vision encoder trained on video, and the corresponding mmproj file must be loaded. Confirmed working in llama.cpp:
-
-- **Qwen2-VL** (7B, 72B) — recommended, well-tested video support
-- **LLaVA-Video**
-- **InternVL2**
-
-The model currently in use (**Qwen3.8-27B**) may not have video support implemented in llama.cpp's mtmd layer even if the upstream model supports it. If Qwen3.8 video support is not yet merged, switch to Qwen2-VL-7B as a drop-in alternative.
-
-### 4. Server launch flags
-
-```bash
-llama-server \
-  --model path/to/model.gguf \
-  --mmproj path/to/mmproj.gguf \
-  --host 0.0.0.0 \
-  --port 8080
-```
-
-No additional flags are required for video — ffmpeg is invoked automatically when an `input_video` content part is received.
-
----
+- Videos are saved through ST's file upload (`/api/files/upload`), so the chat file stores only a path. If the upload fails the video is stored inline as base64 (slow chat load/save).
+- Files over **Max video size** (default 50 MB) are refused. Backend mode sends the full file base64-encoded (+33%) through ST and any tunnel; proxies such as Cloudflare have request body limits (100 MB on lower plans — verify).
+- Frontend mode downloads ffmpeg.wasm (~30 MB) from jsDelivr on first use; change the source in settings to self-host.
 
 ## Diagnosing silent video drops
 
-If the model responds as if no video was attached, check the prompt eval token count in the server logs:
-
-```
-prompt eval time = 191.35 ms / 4 tokens
-```
-
-**4 tokens = text only.** Video frames, once decoded, produce hundreds to thousands of additional visual tokens. The prompt eval token count will be significantly higher and take several seconds if video is being processed correctly.
-
-Common causes of silent drops:
+Check the server's prompt eval token count: a few tokens means text only; a video should add thousands.
 
 | Symptom | Cause |
 |---|---|
-| Low token count, no ffmpeg output in logs | ffmpeg not found in server PATH |
-| Low token count, server started without errors | Build predates mtmd video support |
-| Low token count, mmproj loaded successfully | mmproj/model doesn't support video |
-| Error in server logs mentioning MOOV | MP4 missing faststart flag — re-encode: `ffmpeg -i input.mp4 -movflags +faststart -c copy output.mp4` |
-
----
-
-## Verifying it works
-
-When video is processed correctly you will see in the server logs:
-
-- ffmpeg subprocess invocation (decoding frames)
-- Significantly higher prompt eval token count (hundreds+)
-- The model describing actual video content
+| Low token count, nothing in the extension console | Request wasn't injected: source isn't Custom, quiet/impersonate request, or the newest user message has no video |
+| HTTP 400 mentioning video (backend mode) | Build predates #27921 |
+| No ffmpeg activity (backend mode) | ffmpeg not in the server's PATH |
+| Error mentioning MOOV | MP4 missing faststart: `ffmpeg -i in.mp4 -movflags +faststart -c copy out.mp4` |
+| "Frame extraction failed" toast | Browser couldn't load ffmpeg.wasm (offline/CDN blocked) or file too large for wasm memory |
