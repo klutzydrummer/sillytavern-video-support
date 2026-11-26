@@ -23,7 +23,7 @@ Context used = frames x tokens per frame.
 
 ## Audio
 
-The extension does not extract or send audio. Frames and llama.cpp's video path carry images only. **LFM3-Omni** can use the video's soundtrack; whether it is used depends on the server stack receiving the video (backend mode with a runner that forwards audio). That path is not verified here.
+By default the extension sends no audio. In frontend mode, tick "Also send the video's audio" to decode the soundtrack in the browser (mono, 16 kHz WAV, ~1.9 MB base64 per minute) and send it as an `input_audio` part after the frames. This needs an audio-capable model (e.g. **LFM3-Omni**) behind a server that accepts `input_audio`; other servers may reject the request. Videos without a decodable audio track are sent frames-only.
 
 ## Requirements (backend mode)
 

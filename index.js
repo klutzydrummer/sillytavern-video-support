@@ -20,6 +20,11 @@ import {
     getOwnedVideoUrl,
     isInjectableGenType,
     isMainGenerateUrl,
+    AUDIO_SAMPLE_RATE,
+    encodeWav16,
+    bytesToBase64,
+    makeAudioPart,
+    appendPartsToLastUser,
 } from './video-utils.js';
 
 const SETTINGS_KEY = 'videoSupport';
@@ -56,6 +61,7 @@ const DEFAULTS = {
     jpegQuality: 0.7,
     maxUploadMB: 50, // refuse videos larger than this (base64 inflates ~33% on the wire)
     cdnBase: DEFAULT_CDN_BASE,
+    sendAudio: false, // frontend mode only: also send the soundtrack as an input_audio part
     debug: false,
 };
 
@@ -85,6 +91,7 @@ function applySettingsToUI() {
     $('#video_support_tokens_per_frame').val(settings().tokensPerFrame);
     $('#video_support_max_upload_mb').val(settings().maxUploadMB);
     $('#video_support_cdn_base').val(settings().cdnBase);
+    $('#video_support_send_audio').prop('checked', settings().sendAudio);
     $('#video_support_debug').prop('checked', settings().debug);
     toggleFrontendOptions();
     updateTokenEstimate();
@@ -134,6 +141,10 @@ function bindSettingsEvents() {
     });
     $('#video_support_jpeg_quality').on('input', function () {
         settings().jpegQuality = Math.max(0.1, Math.min(1.0, Number($(this).val())));
+        saveSettingsDebounced();
+    });
+    $('#video_support_send_audio').on('change', function () {
+        settings().sendAudio = $(this).is(':checked');
         saveSettingsDebounced();
     });
     $('#video_support_debug').on('change', function () {
@@ -286,6 +297,41 @@ function blobToDataUrl(blob) {
 }
 
 // ---------------------------------------------------------------------------
+// Audio extraction — the browser decodes the video's soundtrack (no ffmpeg needed),
+// downmixes to mono and resamples to 16 kHz. Videos without audio return null and are
+// sent frames-only.
+// ---------------------------------------------------------------------------
+
+const audioCache = new Map();
+
+async function getAudioForVideo(videoUrl, dataUrl) {
+    if (audioCache.has(videoUrl)) return audioCache.get(videoUrl);
+    let b64 = null;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ctx = AC ? new AC() : null;
+    try {
+        if (!ctx) throw new Error('Web Audio is not available');
+        const decoded = await ctx.decodeAudioData(dataUrlToUint8Array(dataUrl).buffer);
+        const len = Math.max(1, Math.ceil(decoded.duration * AUDIO_SAMPLE_RATE));
+        const off = new OfflineAudioContext(1, len, AUDIO_SAMPLE_RATE); // mixes down to mono
+        const src = off.createBufferSource();
+        src.buffer = decoded;
+        src.connect(off.destination);
+        src.start();
+        const rendered = await off.startRendering();
+        b64 = bytesToBase64(encodeWav16(rendered.getChannelData(0)));
+    } catch (err) {
+        console.warn('[VideoSupport] No usable audio (sending frames only):', err);
+        toastr.warning('Could not decode the video\'s audio; sending frames only.', 'Video Support');
+    } finally {
+        ctx?.close();
+    }
+    if (audioCache.size >= FRAME_CACHE_MAX_ENTRIES) audioCache.delete(audioCache.keys().next().value);
+    audioCache.set(videoUrl, b64);
+    return b64;
+}
+
+// ---------------------------------------------------------------------------
 // Frame cache — swipes/regenerations re-send the same video repeatedly.
 // Skip re-extraction when the video and the extraction-relevant settings
 // haven't changed since the last run.
@@ -352,6 +398,10 @@ function patchFetch() {
                         if (frames.length > 0) {
                             options = injectFrames(options, frames);
                         }
+                        if (settings().sendAudio) {
+                            const audio = await getAudioForVideo(videoUrl, dataUrl);
+                            if (audio) options = injectAudio(options, audio);
+                        }
                     } else {
                         options = injectInputVideo(options, dataUrl);
                     }
@@ -385,6 +435,14 @@ async function resolveVideoDataUrl(url) {
     const res = await (originalFetchRef ?? window.fetch)(url);
     if (!res.ok) throw new Error(`Could not read stored video (${res.status})`);
     return blobToDataUrl(await res.blob());
+}
+
+/** Frontend mode, opt-in: inject the soundtrack as an input_audio part after the frames. */
+function injectAudio(options, base64Wav) {
+    const body = JSON.parse(options.body);
+    if (!appendPartsToLastUser(body, [makeAudioPart(base64Wav)])) return options;
+    console.debug('[VideoSupport] Injected input_audio (frontend mode)');
+    return { ...options, body: JSON.stringify(body) };
 }
 
 /** Backend mode: inject raw video as input_video. */
@@ -609,6 +667,13 @@ function createSettingsUI() {
                     <label for="video_support_cdn_base">ffmpeg.wasm source (npm-layout base URL)</label>
                     <input type="text" id="video_support_cdn_base" class="text_pole" />
                     <small class="video-support-hint">Frontend mode downloads ffmpeg.wasm (~30 MB) from here on first use. Default is jsDelivr (needs browser internet). To avoid the CDN, self-host @ffmpeg/ffmpeg 0.12.15, @ffmpeg/util 0.12.1 and @ffmpeg/core 0.12.9 in an npm-style folder and point this at it. Reload ffmpeg by changing the value.</small>
+                </div>
+                <div class="video-support-setting">
+                    <label class="checkbox_label" for="video_support_send_audio">
+                        <input type="checkbox" id="video_support_send_audio" />
+                        Also send the video's audio (frontend mode)
+                    </label>
+                    <small class="video-support-hint">Decodes the soundtrack in the browser (mono, 16 kHz WAV) and sends it as an input_audio part after the frames. Only for audio-capable models (e.g. LFM3-Omni); other servers may reject it. Adds about 2 MB of base64 per minute.</small>
                 </div>
                 <div class="video-support-setting">
                     <label class="checkbox_label" for="video_support_debug">
