@@ -43,6 +43,27 @@ Older builds reject `video_url`/`input_video` with HTTP 400; use frontend mode t
 - Files over **Max video size** (default 50 MB) are refused. Backend mode sends the full file base64-encoded (+33%) through ST and any tunnel; proxies such as Cloudflare have request body limits (100 MB on lower plans — verify).
 - Frontend mode downloads ffmpeg.wasm (~30 MB) from jsDelivr on first use; change the source in settings to self-host.
 
+## Dossier routing and sync
+
+With **Media routing** set to *Dossier* (the default) and an **RTR URL** set, each video goes once to a media model through the RTR router on the GPU box (vastai-llmrunner). The roleplay model then gets a text dossier, never the video or audio again. With *Direct*, or with the RTR URL empty, the extension uses the older path above and re-sends the media.
+
+- **RTR URL:** the base URL of the box, the same one the chat API uses, without `/v1`. The extension adds `/v1/chat/completions` and sends `model: media-dossier`; on the box, guard passes that request to RTR, which listens on loopback only. As built, vastai-llmrunner has no separate `/rtr` route, so the `https://your-box/rtr` placeholder does not match it. The browser calls this URL directly, so the box or its proxy must allow cross-origin requests from SillyTavern; whether that works through the current proxy, and on TauriTavern, is untested [U].
+- **During a swap** the box holds other chat requests for up to 600 s by default, then answers 503 "media swap in progress". After a swap the roleplay model re-reads the whole chat on its next reply.
+- **Audio** goes to the media model only when "Also send the video's audio" is ticked, as in frontend mode.
+- **"The roleplay model accepts images"** is off by default. Key frames are sent to the roleplay model only when it is on and "Send key frames to the roleplay model" is on too. Then the reply right after a video is processed gets its top key frames (default 3, at most 6) with timestamp captions; later replies get frames only when you cite a matching timestamp or press "Send frames" on the item.
+- **Storage self-test** (button at the bottom of the settings): with a chat open it checks the hash path, a test transcript upload and read-back, a chat metadata save and reload, and the branch copy trigger. It writes and then removes a small test file and a marker. Run it once on each new device.
+
+Where things are stored: the dossier lives in the chat's metadata (the chat file), and the transcript (the speech lines) is a separate `md-<hash>.json` file under `user/files`. Two badges can appear on an item:
+
+- **"transcript not kept"**: the upload was not available, so only the dossier was saved. A follow-up that needs the transcript processes the media again.
+- **"transcript not on this device"**: the dossier points to a transcript file that is missing here or fails its size or sha256 check (for example after a sync). It is handled the same way.
+
+Sync between devices:
+
+- There is no sync requirement in this version. Each device works on its own.
+- TauriTavern's default TT-Sync already carries both parts: dossiers travel with the chat files and transcripts with `user/files`. Keep `user.files` selected in TT-Sync, and do not use Mirror for it.
+- Sync works per file and the last writer wins. If the same chat file changes on two devices, the dossiers added on the device that loses the conflict are lost. This is accepted for now; reprocess the video on the device that lost them.
+
 ## Diagnosing silent video drops
 
 Check the server's prompt eval token count: a few tokens means text only; a video should add thousands.
