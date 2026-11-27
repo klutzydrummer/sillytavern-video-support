@@ -200,7 +200,10 @@ export function createStore(adapter) {
      * @returns {Promise<{status: 'ok', speech: any[]} | {status: 'not_kept'|'not_on_device', badge: string, reason?: string}>}
      */
     async function loadTranscript(version) {
-        const ptr = version?.provenance?.transcript;
+        return readPointer(version?.provenance?.transcript);
+    }
+
+    async function readPointer(ptr) {
         if (!ptr) return { status: 'not_kept', badge: BADGE_NOT_KEPT };
         const notHere = (reason) => ({ status: 'not_on_device', badge: BADGE_NOT_ON_DEVICE, reason });
         let bytes = null;
@@ -247,7 +250,68 @@ export function createStore(adapter) {
         return true;
     }
 
-    return { completePass, lookup, getItem, activeVersion, loadTranscript, onChatOpened, takeNotKeptNotice };
+    /** All items in the open chat: [{id, item}] (P6). */
+    function listItems() {
+        return Object.entries(ns()?.items ?? {}).map(([id, item]) => ({ id, item }));
+    }
+
+    /**
+     * Mutate one item's protocol state (pending queue, selected model, …) and save
+     * once (P6). Creates the item with no versions when absent.
+     */
+    async function updateItem(itemId, fn, { save = true } = {}) {
+        const store = ns(true);
+        const item = store.items[itemId] ?? (store.items[itemId] = { versions: [], next_seq: 1 });
+        const r = fn(item);
+        if (save) await adapter.saveMetadata();
+        return r;
+    }
+
+    /**
+     * Apply a merged requery to the active version in place (P6, T-F6). `dossier`
+     * is the already-merged summary part; `speech` (delta speech entries) goes to
+     * its own md-<hex>.json file whose pointer lands in the record (Q22). The
+     * record is appended to provenance.requeries. One saveMetadata().
+     * @returns {Promise<{version: object|null, badge: string|null, reason?: string}>}
+     */
+    async function applyDelta(itemId, { dossier, speech = [], record = {} }) {
+        const v = activeVersion(itemId);
+        if (!v) return { version: null, badge: null, reason: 'no active version' };
+        const rq = Array.isArray(v.provenance.requeries) ? v.provenance.requeries : (v.provenance.requeries = []);
+        let badge = null, reason;
+        let transcript = null;
+        if (speech.length) {
+            const w = await writeTranscript(v.provenance.key, `${v.version_id}#rq${rq.length + 1}`, speech);
+            transcript = w.pointer;
+            if (!w.pointer) { badge = BADGE_NOT_KEPT; reason = w.reason; if (!notKeptNoticeShown) notKeptNoticePending = true; }
+        }
+        rq.push({ ...record, transcript });
+        v.dossier = dossier;
+        await adapter.saveMetadata();
+        return { version: v, badge, reason };
+    }
+
+    /**
+     * Speech for a version: the first-pass transcript plus every requery's speech
+     * file (P6, T2). The status and badge are the first-pass transcript's; a missing
+     * requery file only adds its reason.
+     */
+    async function loadSpeech(version) {
+        const base = await loadTranscript(version);
+        const speech = base.status === 'ok' ? [...base.speech] : [];
+        const missing = [];
+        for (const rq of version?.provenance?.requeries ?? []) {
+            if (!rq?.transcript) continue;
+            const r = await readPointer(rq.transcript);
+            if (r.status === 'ok') speech.push(...r.speech);
+            else missing.push(r.reason || r.status);
+        }
+        speech.sort((a, b) => (Number(a?.t0) || 0) - (Number(b?.t0) || 0));
+        return base.status === 'ok' ? { status: 'ok', speech, missing } : { ...base, speech, missing };
+    }
+
+    return { completePass, lookup, getItem, activeVersion, loadTranscript, loadSpeech, onChatOpened, takeNotKeptNotice,
+        listItems, updateItem, applyDelta };
 }
 
 /**
