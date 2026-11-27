@@ -9,6 +9,10 @@
  * Video is stored in extra.media (ST's native format) for persistence.
  * The fetch rewrite reads pendingVideo (current send) or extra.media
  * (regeneration) and injects the appropriate content parts.
+ *
+ * P6 (routing "dossier", RTR URL set): media goes once to a media model through
+ * RTR (pipeline.js); RP requests then get text tiers only, never media (Q26a).
+ * The legacy path above stays for routing "direct" or an empty RTR URL.
  */
 
 import { chat, eventSource, event_types, saveChatConditional, getRequestHeaders } from '../../../../script.js';
@@ -27,6 +31,16 @@ import {
     appendPartsToLastUser,
 } from './video-utils.js';
 import { createStore, runStorageSelfTest } from './dossier-store.js';
+import { sha256 } from './hash.js';
+import { CHAT_SETTINGS_KEY, resolveSettings, settingsRows, setGlobal, setChat } from './settings.js';
+import { createRtrClient } from './rtr-client.js';
+import { createProtocol } from './pipeline.js';
+import { buildTiers, createTranscriptCache } from './tiers.js';
+import { buildCapsule, buildMediaParts, mediaSeconds } from './prompts.js';
+import { itemHandle } from './queue.js';
+import { REGEN_CHOICES, dropdownOptions, resolveMediaModel } from './media-models.js';
+import { ROUTING_DOSSIER, ROUTING_DIRECT, routingMode, injectTiers, progressText, requeryBarModel,
+    itemCardModel, parseQuestionLines } from './protocol-view.js';
 
 const SETTINGS_KEY = 'videoSupport';
 
@@ -65,6 +79,13 @@ const DEFAULTS = {
     cdnBase: DEFAULT_CDN_BASE,
     sendAudio: false, // frontend mode only: also send the soundtrack as an input_audio part
     debug: false,
+    // P6 protocol
+    routing: ROUTING_DOSSIER, // 'dossier' (media once via RTR, tiers after) | 'direct' (legacy re-send)
+    rtrBaseUrl: '',           // RTR on the box, e.g. https://<box>/rtr; empty = legacy path
+    gpuLabel: '',             // keys the learned time averages (estimate.js)
+    protocol: {},             // global layer of settings.js; per-chat layer is in chatMetadata
+    stats: {},                // EMA timing averages, model|gpu → field → {v, n}
+    mmproj: {},               // last mmproj_sha256 RTR reported per media model (soft key)
 };
 
 // ---------------------------------------------------------------------------
@@ -79,7 +100,7 @@ function loadSettings() {
     if (!extension_settings[SETTINGS_KEY]) extension_settings[SETTINGS_KEY] = {};
     for (const [k, v] of Object.entries(DEFAULTS)) {
         if (extension_settings[SETTINGS_KEY][k] === undefined) {
-            extension_settings[SETTINGS_KEY][k] = v;
+            extension_settings[SETTINGS_KEY][k] = v && typeof v === 'object' ? structuredClone(v) : v;
         }
     }
 }
@@ -95,6 +116,10 @@ function applySettingsToUI() {
     $('#video_support_cdn_base').val(settings().cdnBase);
     $('#video_support_send_audio').prop('checked', settings().sendAudio);
     $('#video_support_debug').prop('checked', settings().debug);
+    $('#video_support_routing').val(routingMode(settings()));
+    $('#video_support_rtr_url').val(settings().rtrBaseUrl);
+    $('#video_support_gpu_label').val(settings().gpuLabel);
+    renderProtocolSettings();
     toggleFrontendOptions();
     updateTokenEstimate();
 }
@@ -152,6 +177,20 @@ function bindSettingsEvents() {
     $('#video_support_selftest').on('click', onStorageSelfTest);
     $('#video_support_debug').on('change', function () {
         settings().debug = $(this).is(':checked');
+        saveSettingsDebounced();
+    });
+    $('#video_support_routing').on('change', function () {
+        settings().routing = $(this).val() === ROUTING_DIRECT ? ROUTING_DIRECT : ROUTING_DOSSIER;
+        saveSettingsDebounced();
+        renderItems();
+    });
+    $('#video_support_rtr_url').on('change', function () {
+        settings().rtrBaseUrl = String($(this).val()).trim();
+        saveSettingsDebounced();
+        renderItems();
+    });
+    $('#video_support_gpu_label').on('change', function () {
+        settings().gpuLabel = String($(this).val()).trim();
         saveSettingsDebounced();
     });
 }
@@ -383,6 +422,8 @@ function patchFetch() {
     const originalFetch = window.fetch;
 
     window.fetch = async function (url, options = {}) {
+        // Our own question pass (generateRaw) must reach the RP model untouched.
+        if (bypassFetch > 0) return originalFetch.call(this, url, options);
         if (
             options.body &&
             typeof options.body === 'string' &&
@@ -391,6 +432,15 @@ function patchFetch() {
             isInjectableGenType(currentGenType, currentGenDryRun) &&
             isCustomSource(options.body)
         ) {
+            if (protocolActive()) {
+                // Q26a: tiers as text, never media.
+                try {
+                    options = await injectProtocolTiers(options);
+                } catch (err) {
+                    console.error('[VideoSupport] Failed to add media dossier tiers:', err);
+                }
+                return originalFetch.call(this, url, options);
+            }
             // pendingVideo = being sent right now; otherwise only a video owned by the newest user message
             const videoUrl = pendingVideo?.dataUrl ?? getOwnedVideoUrl(chat);
             if (videoUrl) {
@@ -510,7 +560,12 @@ async function onMessageSent(messageId) {
     if (msg) {
         if (!msg.extra) msg.extra = {};
         if (!Array.isArray(msg.extra.media)) msg.extra.media = [];
-        const url = await uploadVideo(dataUrl, fileName);
+        const upload = uploadVideo(dataUrl, fileName);
+        if (protocolActive()) {
+            // The RP request awaits this in the fetch patch (Open fork: first pass there).
+            trackFirstPass(upload.then(url => startFirstPass({ url, title: fileName, messageId, dataUrl })));
+        }
+        const url = await upload;
         msg.extra.media.push({ type: 'video', url, title: fileName, source: 'upload' });
         await saveChatConditional();
         console.debug('[VideoSupport] Saved video to message', messageId);
@@ -596,12 +651,17 @@ const storageAdapter = {
 const dossierStore = createStore(storageAdapter);
 
 async function onChatChanged() {
+    transcriptCache.clear();
+    lastDecisions = [];
+    renderRequeryBar();
+    renderProtocolSettings();
     try {
         const r = await dossierStore.onChatOpened();
         if (r.copied) console.log(`[VideoSupport] Copied ${r.items} media dossier item(s) from the parent chat`);
     } catch (err) {
         console.warn('[VideoSupport] Branch dossier check failed:', err);
     }
+    renderItems();
 }
 
 async function onStorageSelfTest() {
@@ -615,6 +675,322 @@ async function onStorageSelfTest() {
     } catch (err) {
         out.text(`FAIL  ${String(err?.message || err)}`);
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// P6 media protocol glue. Decisions live in the pure modules (pipeline.js,
+// queue.js, tiers.js, protocol-view.js), which have node tests; this section
+// only reads ST state and draws DOM, so it is checked with node --check alone.
+// Real ST / TauriTavern / phone behaviour here is unverified [U].
+// ---------------------------------------------------------------------------
+
+let firstPass = null;          // in-flight first pass of the newest attachment
+let bypassFetch = 0;           // > 0 while our own question pass runs (re-entrancy)
+const itemStatus = new Map();  // itemId → {busy:{label}} | {error} | null
+const transcriptCache = createTranscriptCache(dossierStore);
+let lastDecisions = [];
+
+function protocolActive() {
+    return routingMode(settings()) === ROUTING_DOSSIER && !!String(settings().rtrBaseUrl || '').trim();
+}
+
+function chatLayer(create = false) {
+    let md;
+    try { md = stContext().chatMetadata; } catch { return {}; }
+    if (!md) return {};
+    if (!md[CHAT_SETTINGS_KEY] && create) md[CHAT_SETTINGS_KEY] = {};
+    return md[CHAT_SETTINGS_KEY] || {};
+}
+
+function protocolSettings() {
+    return resolveSettings(settings().protocol, chatLayer());
+}
+
+/** Built per call so a changed URL applies at once. Goes straight to the box (Open fork: transport). */
+function rtrClient() {
+    return createRtrClient({ fetch: (...a) => (originalFetchRef ?? window.fetch)(...a), baseUrl: settings().rtrBaseUrl });
+}
+
+function capsuleContext() {
+    const ctx = stContext();
+    const ch = ctx.characters?.[ctx.characterId];
+    return {
+        charName: ctx.name2 || ch?.name || '',
+        charDescription: ch?.description || '',
+        userName: ctx.name1 || '',
+        messages: (ctx.chat || chat || []).filter(m => m && !m.is_system).map(m => ({ name: m.name, text: m.mes })),
+    };
+}
+
+/** Question pass on the RP model. [U] generateRaw's jsonSchema form; retried plain if rejected. */
+async function askQuestions({ prompt, schema, maxTokens }) {
+    const ctx = stContext();
+    const s = protocolSettings();
+    const capsule = buildCapsule(capsuleContext(), s);
+    const full = capsule ? `${capsule}\n\n${prompt}` : prompt;
+    bypassFetch++;
+    try {
+        try {
+            return await ctx.generateRaw({ prompt: full, responseLength: maxTokens, jsonSchema: { name: 'media_questions', strict: true, value: schema } });
+        } catch (err) {
+            console.warn('[VideoSupport] Question pass with a JSON schema failed; retrying plain:', err);
+            return await ctx.generateRaw({ prompt: full, responseLength: maxTokens });
+        }
+    } finally {
+        bypassFetch--;
+    }
+}
+
+/** Media for the RTR call, from the stored file (frames/audio reuse the legacy caches). */
+async function getMediaForItem(_itemId, item) {
+    const url = item?.media_url;
+    if (!url) throw new Error('no stored media for this item');
+    const dataUrl = await resolveVideoDataUrl(url);
+    if (settings().mode === 'frontend') {
+        const frames = await getFramesForVideo(url, dataUrl);
+        const audio = settings().sendAudio ? await getAudioForVideo(url, dataUrl) : null;
+        const fps = settings().fps;
+        return { mediaParts: buildMediaParts({ mode: 'frontend', frames, fps, audioB64: audio }), mediaSeconds: mediaSeconds({ frames, fps }) };
+    }
+    return { mediaParts: buildMediaParts({ mode: 'backend', videoUrl: dataUrl }), mediaSeconds: null };
+}
+
+const protocol = createProtocol({
+    store: dossierStore,
+    rtr: { plan: (a) => rtrClient().plan(a), run: (a) => rtrClient().run(a) },
+    askQuestions,
+    getMedia: getMediaForItem,
+    capsuleContext,
+    settings: protocolSettings,
+    getStats: () => settings().stats || {},
+    setStats: (st) => { settings().stats = st; saveSettingsDebounced(); },
+    gpu: () => settings().gpuLabel || '',
+    rpModel: () => null, // RTR resolves the loaded RP model
+    knownMmproj: (lsId) => settings().mmproj?.[lsId],
+    rememberMmproj: (lsId, sha) => { settings().mmproj = { ...(settings().mmproj || {}), [lsId]: sha }; saveSettingsDebounced(); },
+    onStatus: (id, st) => { itemStatus.set(id, st); renderItems(); },
+});
+
+function trackFirstPass(p) {
+    const tracked = p.catch(err => console.error('[VideoSupport] Media first pass failed:', err))
+        .finally(() => { if (firstPass === tracked) firstPass = null; });
+    firstPass = tracked;
+    return tracked;
+}
+
+/** Hash → register → cache lookup / first pass. Item id = media sha256. */
+async function startFirstPass({ url, title, messageId, dataUrl }) {
+    const bytes = dataUrl.startsWith('data:') ? dataUrlToUint8Array(dataUrl) : dataUrlToUint8Array(await resolveVideoDataUrl(dataUrl));
+    const { hex: id } = await sha256(bytes);
+    await protocol.registerItem({ id, title, mediaUrl: url, messageId });
+    renderItems();
+    const r = await protocol.ensureDossier(id);
+    if (r.status === 'failed') toastr.error(r.error || 'Media pass failed', 'Video Support');
+    else if (r.status === 'stale') toastr.warning('Using a stale dossier (media model projector changed). Regenerate to refresh.', 'Video Support');
+    if (r.badge) toastr.warning(`Dossier saved; ${r.badge}.`, 'Video Support');
+    renderItems();
+    return r;
+}
+
+function lastUserText(messages) {
+    for (let i = (messages || []).length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role !== 'user') continue;
+        if (typeof m.content === 'string') return m.content;
+        if (Array.isArray(m.content)) return m.content.filter(p => p?.type === 'text').map(p => p.text).join('\n');
+        return '';
+    }
+    return '';
+}
+
+/** RP request in dossier mode: wait for a running first pass, then add T0/T1/T2/F as text. */
+async function injectProtocolTiers(options) {
+    // A video owned by the newest user message with no item yet (older chat, regenerate): first pass now.
+    const owned = getOwnedVideoUrl(chat);
+    if (owned && !firstPass && !dossierStore.listItems().some(x => x.item.media_url === owned)) {
+        let lastUser = -1;
+        for (let i = chat.length - 1; i >= 0; i--) if (chat[i]?.is_user) { lastUser = i; break; }
+        const title = chat[lastUser]?.extra?.media?.find(m => m.url === owned)?.title || 'video';
+        trackFirstPass(startFirstPass({ url: owned, title, messageId: lastUser, dataUrl: owned }));
+    }
+    if (firstPass) await firstPass;
+    const items = protocol.tierItems();
+    if (!items.length) return options;
+    const body = JSON.parse(options.body);
+    const tiers = await buildTiers(items, lastUserText(body.messages), protocolSettings(), transcriptCache);
+    for (const [id, badge] of tiers.badges) itemStatus.set(id, { ...(itemStatus.get(id) || {}), transcriptBadge: badge });
+    const added = injectTiers(body, { t0: tiers.t0.text, t1: tiers.t1.text, t2: tiers.t2.text, handles: items.map(it => itemHandle(it.id)) });
+    if (!added) return options;
+    if (settings().debug) console.debug('[VideoSupport] Tiers', { t0: tiers.t0.tokens, t1: tiers.t1.tokens, t2: tiers.t2.tokens });
+    return { ...options, body: JSON.stringify(body) };
+}
+
+/** RP reply done: strip <media_q>, queue, then auto / confirm per item. [U] runs after streaming ends. */
+async function onMessageReceived(messageId) {
+    if (!protocolActive()) return;
+    const msg = chat[messageId];
+    if (!msg || msg.is_user || typeof msg.mes !== 'string') return;
+    let out;
+    try {
+        out = await protocol.afterRpTurn({ text: msg.mes, turn: Number(messageId) || 0 });
+    } catch (err) {
+        console.error('[VideoSupport] Follow-up handling failed:', err);
+        return;
+    }
+    if (out.text !== msg.mes) {
+        msg.mes = out.text;
+        if (Array.isArray(msg.swipes)) msg.swipes[msg.swipe_id ?? 0] = out.text;
+        try { stContext().updateMessageBlock?.(messageId, msg); } catch (err) { console.warn('[VideoSupport] Could not redraw message:', err); }
+        await saveChatConditional();
+    }
+    lastDecisions = out.decisions;
+    renderRequeryBar();
+    for (const p of out.auto) {
+        p.then(r => { if (r?.status === 'ok') toastr.info('Media follow-up answered; it applies from the next reply.', 'Video Support'); })
+            .finally(() => { transcriptCache.clear(); renderItems(); });
+    }
+    renderItems();
+}
+
+// --- DOM: item list, dialog, requery bar, settings rows ----------------------
+
+function badgeEl(b) {
+    return $('<span>', { class: `video-support-badge tone-${b.tone}`, title: b.title || '' }).text(b.text);
+}
+
+function renderItems() {
+    const box = $('#video_support_items');
+    if (!box.length) return;
+    let list = [];
+    try { if (protocolActive()) list = dossierStore.listItems(); } catch { list = []; }
+    box.empty().toggle(list.length > 0);
+    list.sort((a, b) => (a.item.order ?? 0) - (b.item.order ?? 0));
+    for (const { id, item } of list) {
+        const st = itemStatus.get(id) || null;
+        let lookup = null;
+        try { const m = protocol.itemModel(item); lookup = m ? protocol.lookupFor(id, m) : null; } catch { lookup = null; }
+        const vm = itemCardModel({ id, item, lookup, busy: st?.busy || null, error: st?.error || null, transcriptBadge: st?.transcriptBadge || null });
+        const row = $('<div>', { class: 'video-support-item', 'data-id': id });
+        row.append($('<span>', { class: 'video-support-item-title', title: `id ${vm.handle}` }).text(vm.title));
+        const sel = $('<select>', { class: 'text_pole video-support-item-model', title: 'Media model for this item' });
+        for (const o of vm.options) sel.append($('<option>', { value: o.value, selected: o.selected }).text(o.label));
+        sel.on('change', async () => { await protocol.setSelectedModel(id, sel.val()); renderItems(); });
+        row.append(sel);
+        const badges = $('<span>', { class: 'video-support-badges' });
+        vm.badges.forEach(b => badges.append(badgeEl(b)));
+        row.append(badges);
+        if (!vm.canAsk && !st?.busy) {
+            row.append($('<button>', { class: 'menu_button', text: 'Run' }).on('click', () => runAndReport(() => protocol.ensureDossier(id))));
+        }
+        if (vm.canAsk) row.append($('<button>', { class: 'menu_button', text: 'Ask' }).on('click', () => openDialog(id, 'ask')));
+        if (vm.canRegenerate) row.append($('<button>', { class: 'menu_button', text: 'Regenerate' }).on('click', () => openDialog(id, 'regenerate')));
+        box.append(row);
+    }
+}
+
+async function runAndReport(fn) {
+    try {
+        const r = await fn();
+        if (r?.status === 'failed') toastr.error(r.error || 'Media call failed', 'Video Support');
+    } catch (err) {
+        toastr.error(String(err?.message || err), 'Video Support');
+    } finally {
+        transcriptCache.clear();
+        renderItems();
+    }
+}
+
+/** Ask (questions only) or Regenerate (F10: same / other model / extra questions), with the estimate shown first. */
+function openDialog(id, kind) {
+    $('.video-support-dialog').remove();
+    const item = dossierStore.getItem(id);
+    const dlg = $('<div>', { class: 'video-support-dialog' });
+    let choice = null, modelSel = null;
+    if (kind === 'regenerate') {
+        choice = $('<select>', { class: 'text_pole' });
+        REGEN_CHOICES.forEach(c => choice.append($('<option>', { value: c.value }).text(c.label)));
+        modelSel = $('<select>', { class: 'text_pole' }).hide();
+        dropdownOptions(item?.selected_model).forEach(o => modelSel.append($('<option>', { value: o.value, selected: o.selected }).text(o.label)));
+        dlg.append(choice, modelSel);
+    }
+    const text = $('<textarea>', { class: 'text_pole', rows: 3, placeholder: 'One question per line' });
+    const est = $('<small>', { class: 'video-support-hint' }).text('Estimating…');
+    const go = $('<button>', { class: 'menu_button', text: kind === 'ask' ? 'Ask now' : 'Regenerate' });
+    const cancel = $('<button>', { class: 'menu_button', text: 'Cancel' }).on('click', () => dlg.remove());
+    dlg.append(text, est, go, cancel);
+    const refresh = async () => {
+        const c = choice?.val() || 'ask';
+        text.toggle(kind === 'ask' || c === 'questions');
+        modelSel?.toggle(c === 'model');
+        try {
+            const model = c === 'model' ? resolveMediaModel(modelSel.val()) : protocol.itemModel(item);
+            const pv = await protocol.preview(model, kind === 'ask' ? 'delta' : 'dossier', null);
+            est.text(progressText(pv, { kind: kind === 'ask' ? 'delta' : 'dossier' }));
+        } catch (err) {
+            est.text(`No estimate: ${err?.message || err}`);
+        }
+    };
+    choice?.on('change', refresh);
+    modelSel?.on('change', refresh);
+    go.on('click', () => {
+        const qs = parseQuestionLines(text.val(), protocolSettings().maxQuestions);
+        dlg.remove();
+        if (kind === 'ask') {
+            if (!qs.length) return;
+            runAndReport(() => protocol.ask(id, qs));
+        } else {
+            runAndReport(() => protocol.regenerate(id, choice.val(), { modelKey: modelSel.val(), questions: qs }));
+        }
+    });
+    $(`.video-support-item[data-id="${id}"]`).after(dlg);
+    refresh();
+}
+
+/** T-F7 confirm bar: [Ask now] [Later] per item. */
+function renderRequeryBar() {
+    const bar = $('#video_support_requery');
+    if (!bar.length) return;
+    let titles = {};
+    try { titles = Object.fromEntries(dossierStore.listItems().map(({ id, item }) => [id, item.title])); } catch { titles = {}; }
+    const m = requeryBarModel(lastDecisions, titles);
+    bar.empty().toggle(m.visible);
+    for (const it of m.items) {
+        const drop = () => { lastDecisions = lastDecisions.filter(d => d.itemId !== it.itemId); renderRequeryBar(); };
+        const row = $('<div>', { class: 'video-support-requery-row' }).append($('<span>').text(it.text));
+        row.append($('<button>', { class: 'menu_button', text: 'Ask now' }).on('click', () => { drop(); runAndReport(() => protocol.requery(it.itemId, 'confirm')); }));
+        row.append($('<button>', { class: 'menu_button', text: 'Later' }).on('click', drop));
+        bar.append(row);
+    }
+}
+
+/** Global and per-chat values side by side; an empty box inherits. */
+function renderProtocolSettings() {
+    const box = $('#video_support_protocol_rows');
+    if (!box.length) return;
+    box.empty();
+    const g = settings().protocol || (settings().protocol = {});
+    const table = $('<table>', { class: 'video-support-protocol-table' });
+    table.append('<tr><th>Setting</th><th>All chats</th><th>This chat</th><th>In use</th></tr>');
+    for (const r of settingsRows(g, chatLayer())) {
+        const tr = $('<tr>');
+        tr.append($('<td>').text(r.label));
+        const gIn = $('<input>', { class: 'text_pole', type: 'text', placeholder: String(r.def), value: r.global ?? '' });
+        const cIn = $('<input>', { class: 'text_pole', type: 'text', placeholder: 'inherit', value: r.chat ?? '' });
+        gIn.on('change', () => { setGlobal(g, r.key, gIn.val()); saveSettingsDebounced(); renderProtocolSettings(); });
+        cIn.on('change', () => {
+            try {
+                setChat(chatLayer(true), r.key, cIn.val(), g);
+                stContext().saveMetadata();
+            } catch (err) {
+                toastr.warning('Open a chat to set per-chat values.', 'Video Support');
+            }
+            renderProtocolSettings();
+        });
+        tr.append($('<td>').append(gIn), $('<td>').append(cIn), $('<td>').text(`${r.effective === '' ? '—' : r.effective} (${r.source})`));
+        table.append(tr);
+    }
+    box.append(table);
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +1028,8 @@ function createAttachUI() {
         $('#options_button').after(btn);
     }
     indicator.insertBefore('#nonQRFormItems');
+    $('<div>', { id: 'video_support_items', css: { display: 'none' } }).insertBefore('#nonQRFormItems');
+    $('<div>', { id: 'video_support_requery', css: { display: 'none' } }).insertBefore('#nonQRFormItems');
 
     btn.on('click', () => fileInput.trigger('click'));
 
@@ -761,6 +1139,30 @@ function createSettingsUI() {
                 </div>
                 <hr>
                 <div class="video-support-setting">
+                    <label for="video_support_routing">Media routing</label>
+                    <select id="video_support_routing" class="text_pole">
+                        <option value="dossier">Dossier (media model once, text after)</option>
+                        <option value="direct">Direct (re-send media every reply)</option>
+                    </select>
+                    <small class="video-support-hint">Dossier mode sends each video once to a media model through the RTR router and gives the roleplay model a text dossier afterwards. It needs the RTR URL below; with no URL the direct path is used.</small>
+                </div>
+                <div class="video-support-setting">
+                    <label for="video_support_rtr_url">RTR URL</label>
+                    <input type="text" id="video_support_rtr_url" class="text_pole" placeholder="https://your-box/rtr" />
+                    <small class="video-support-hint">Base URL of the media router on the GPU box (the extension adds /v1/chat/completions). The browser calls it directly.</small>
+                </div>
+                <div class="video-support-setting">
+                    <label for="video_support_gpu_label">GPU label</label>
+                    <input type="text" id="video_support_gpu_label" class="text_pole" placeholder="e.g. RTX 4090" />
+                    <small class="video-support-hint">Time estimates are learned per model and GPU label. A new label starts at "unknown, first run".</small>
+                </div>
+                <div class="video-support-setting">
+                    <label>Dossier settings</label>
+                    <small class="video-support-hint">Empty boxes inherit: this chat → all chats → default.</small>
+                    <div id="video_support_protocol_rows"></div>
+                </div>
+                <hr>
+                <div class="video-support-setting">
                     <input type="button" id="video_support_selftest" class="menu_button" value="Storage self-test" />
                     <small class="video-support-hint">Checks the hash path, a test transcript upload and read-back, chat metadata save/reload and the branch copy trigger. Open a chat first. Writes and removes a small test file and marker.</small>
                     <pre id="video_support_selftest_result" class="video-support-selftest"></pre>
@@ -806,6 +1208,7 @@ jQuery(async () => {
 
     eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
+    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     eventSource.on(event_types.GENERATION_STARTED, (type, _params, dryRun) => {
         currentGenType = type || 'normal';
         currentGenDryRun = !!dryRun;

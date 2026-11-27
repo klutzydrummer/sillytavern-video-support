@@ -91,3 +91,87 @@
 .video-support-selftest:empty {
     display: none;
 }
+
+/* P6 media protocol: item list, badges, Ask/Regenerate dialog, requery bar */
+
+#video_support_items,
+#video_support_requery {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 3px 8px;
+    margin: 2px 0;
+    background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.3));
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.15));
+    border-radius: 6px;
+    font-size: 0.82em;
+    color: var(--SmartThemeBodyColor, #ccc);
+}
+
+.video-support-item,
+.video-support-requery-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+.video-support-item-title {
+    flex: 1 1 8em;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.video-support-item-model {
+    width: auto;
+    max-width: 14em;
+    margin: 0;
+}
+
+.video-support-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+}
+
+.video-support-badge {
+    padding: 0 6px;
+    border-radius: 9px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
+    white-space: nowrap;
+}
+
+.video-support-badge.tone-good { color: #8fd18f; }
+.video-support-badge.tone-warn { color: #e8c062; }
+.video-support-badge.tone-bad { color: #ef7d7d; }
+.video-support-badge.tone-info { color: var(--SmartThemeQuoteColor, #7eb8f7); }
+
+.video-support-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 4px 0 4px 12px;
+    border-left: 2px solid var(--SmartThemeQuoteColor, #7eb8f7);
+}
+
+.video-support-requery-row span {
+    flex: 1 1 12em;
+}
+
+.video-support-protocol-table {
+    width: 100%;
+    font-size: 0.9em;
+}
+
+.video-support-protocol-table th {
+    text-align: left;
+    font-weight: normal;
+    opacity: 0.7;
+}
+
+.video-support-protocol-table input {
+    width: 100%;
+    margin: 0;
+}
