@@ -81,3 +81,13 @@
     font-size: 0.8em;
     line-height: 1.3;
 }
+
+.video-support-selftest {
+    white-space: pre-wrap;
+    font-size: 0.85em;
+    margin: 4px 0 0;
+}
+
+.video-support-selftest:empty {
+    display: none;
+}

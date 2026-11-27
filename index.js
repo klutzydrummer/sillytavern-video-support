@@ -26,11 +26,12 @@ import {
     makeAudioPart,
     appendPartsToLastUser,
 } from './video-utils.js';
+import { createStore, runStorageSelfTest } from './dossier-store.js';
 
 const SETTINGS_KEY = 'videoSupport';
 
 // Dynamic import — extensions.js path varies and static import kills the module silently
-let extension_settings, saveSettingsDebounced;
+let extension_settings, saveSettingsDebounced, getContext;
 async function loadExtensionAPIs() {
     // Try multiple known paths for extensions.js
     const paths = [
@@ -43,6 +44,7 @@ async function loadExtensionAPIs() {
             const mod = await import(path);
             extension_settings = mod.extension_settings;
             saveSettingsDebounced = mod.saveSettingsDebounced;
+            getContext = mod.getContext;
             console.debug('[VideoSupport] Loaded extensions.js from', path);
             return;
         } catch { /* try next */ }
@@ -147,6 +149,7 @@ function bindSettingsEvents() {
         settings().sendAudio = $(this).is(':checked');
         saveSettingsDebounced();
     });
+    $('#video_support_selftest').on('click', onStorageSelfTest);
     $('#video_support_debug').on('change', function () {
         settings().debug = $(this).is(':checked');
         saveSettingsDebounced();
@@ -541,6 +544,80 @@ async function uploadVideo(dataUrl, fileName) {
 }
 
 // ---------------------------------------------------------------------------
+// Dossier storage adapter (dossier-store.js). Real ST / TauriTavern behaviour of
+// these calls is unverified [U]: parent-chat reads and group chats especially.
+// ---------------------------------------------------------------------------
+
+function stContext() {
+    if (typeof getContext !== 'function') throw new Error('getContext unavailable');
+    return getContext();
+}
+
+/** Metadata of a saved chat of the current character or group, read from the chat file. */
+async function readSavedChatMetadata(chatName) {
+    const ctx = stContext();
+    let res;
+    if (ctx.groupId) {
+        res = await fetch('/api/chats/group/get', { method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ id: chatName }) });
+    } else {
+        const ch = ctx.characters?.[ctx.characterId];
+        if (!ch) return null;
+        res = await fetch('/api/chats/get', {
+            method: 'POST', headers: getRequestHeaders(),
+            body: JSON.stringify({ ch_name: ch.name, file_name: chatName, avatar_url: ch.avatar }),
+        });
+    }
+    if (!res.ok) return null;
+    const lines = await res.json();
+    return Array.isArray(lines) ? (lines.find(l => l && typeof l.chat_metadata === 'object')?.chat_metadata ?? null) : null;
+}
+
+const storageAdapter = {
+    getChatMetadata: () => stContext().chatMetadata,
+    saveMetadata: () => stContext().saveMetadata(),
+    getCurrentChatName: () => stContext().getCurrentChatId?.() ?? null,
+    readChatMetadata: readSavedChatMetadata,
+    async uploadFile(name, base64) {
+        const res = await fetch('/api/files/upload', { method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ name, data: base64 }) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const { path } = await res.json();
+        return path;
+    },
+    async readFile(path) {
+        const res = await fetch(path, { cache: 'no-store' });
+        if (!res.ok) return null;
+        return new Uint8Array(await res.arrayBuffer());
+    },
+    async deleteFile(path) {
+        await fetch('/api/files/delete', { method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ path }) });
+    },
+};
+
+const dossierStore = createStore(storageAdapter);
+
+async function onChatChanged() {
+    try {
+        const r = await dossierStore.onChatOpened();
+        if (r.copied) console.log(`[VideoSupport] Copied ${r.items} media dossier item(s) from the parent chat`);
+    } catch (err) {
+        console.warn('[VideoSupport] Branch dossier check failed:', err);
+    }
+}
+
+async function onStorageSelfTest() {
+    const out = $('#video_support_selftest_result');
+    out.text('Running…');
+    try {
+        const { ok, checks } = await runStorageSelfTest(storageAdapter);
+        const mark = (c) => (c.ok === true ? 'PASS' : c.ok === false ? 'FAIL' : 'N/A ');
+        out.text(checks.map(c => `${mark(c)}  ${c.name}: ${c.detail}`).join('\n'));
+        (ok ? toastr.success : toastr.warning)(ok ? 'Storage self-test passed' : 'Storage self-test found problems', 'Video Support');
+    } catch (err) {
+        out.text(`FAIL  ${String(err?.message || err)}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UI — attach button + indicator
 // ---------------------------------------------------------------------------
 
@@ -682,6 +759,12 @@ function createSettingsUI() {
                     </label>
                     <small class="video-support-hint">Log frame sizes to console and show first extracted frame as a preview overlay.</small>
                 </div>
+                <hr>
+                <div class="video-support-setting">
+                    <input type="button" id="video_support_selftest" class="menu_button" value="Storage self-test" />
+                    <small class="video-support-hint">Checks the hash path, a test transcript upload and read-back, chat metadata save/reload and the branch copy trigger. Open a chat first. Writes and removes a small test file and marker.</small>
+                    <pre id="video_support_selftest_result" class="video-support-selftest"></pre>
+                </div>
             </div>
         </div>
     </div>`;
@@ -722,6 +805,7 @@ jQuery(async () => {
     bindSettingsEvents();
 
     eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+    eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
     eventSource.on(event_types.GENERATION_STARTED, (type, _params, dryRun) => {
         currentGenType = type || 'normal';
         currentGenDryRun = !!dryRun;
