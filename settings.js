@@ -30,6 +30,8 @@ export const SETTINGS_SPEC = [
     { key: 'triggerBlocking', label: 'Requery trigger: blocking questions', type: 'int', min: 1, max: 50, def: 1 },
     { key: 'triggerNonBlocking', label: 'Requery trigger: pending questions', type: 'int', min: 1, max: 50, def: 3 },
     { key: 'autoRequeryCapS', label: 'Auto requery estimate cap (s; empty = no cap)', type: 'num', min: 0, max: 3600, def: '', empty: true },
+    { key: 'rpFrames', label: 'Key frames to an image-capable RP (K)', type: 'int', min: 0, max: 6, def: 3 },
+    { key: 'rpFrameCtx', label: 'RP context for the frame cap (tokens; K × tokens/frame + 4k ≤ this)', type: 'int', min: 0, max: 1048576, def: 8192 },
     { key: 'pricePerHour', label: 'Instance price ($/h; empty = unknown)', type: 'num', min: 0, max: 1000, def: '', empty: true },
 ];
 
