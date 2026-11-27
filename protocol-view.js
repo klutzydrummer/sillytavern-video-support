@@ -47,19 +47,6 @@ export function injectTiers(body, { t0 = '', t1 = '', t2 = '', handles = [] }) {
     return added;
 }
 
-/** Remove any media parts (video/frames/audio) the request may carry (Q26a no-resend). */
-export function stripMediaParts(body) {
-    if (!Array.isArray(body?.messages)) return 0;
-    let n = 0;
-    for (const m of body.messages) {
-        if (!Array.isArray(m.content)) continue;
-        const keep = m.content.filter(p => !['image_url', 'input_video', 'input_audio'].includes(p?.type));
-        n += m.content.length - keep.length;
-        m.content = keep;
-    }
-    return n;
-}
-
 /** One-line progress / cost text for a preview (estimate + $ + Q3b hint). */
 export function progressText(preview, { kind = 'dossier' } = {}) {
     if (!preview) return '';

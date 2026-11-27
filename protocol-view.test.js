@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { injectTiers, stripMediaParts, progressText, requeryBarModel, itemCardModel, parseQuestionLines, routingMode } from './protocol-view.js';
+import { injectTiers, progressText, requeryBarModel, itemCardModel, parseQuestionLines, routingMode } from './protocol-view.js';
 
 const A = 'a'.repeat(64);
 
@@ -23,12 +23,6 @@ test('Q26a: tiers go in as text; T0 after the system block, T1/T2/F before the l
     const only = { messages: [{ role: 'user', content: 'u' }] };
     injectTiers(only, { t0: 'T0' });
     assert.deepEqual(only.messages.map(m => m.content), ['T0', 'u']);
-});
-
-test('Q26a: media parts are stripped from the RP request', () => {
-    const body = { messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'image_url', image_url: { url: 'x' } }, { type: 'input_audio' }] }, { role: 'system', content: 's' }] };
-    assert.equal(stripMediaParts(body), 2);
-    assert.deepEqual(body.messages[0].content, [{ type: 'text', text: 'hi' }]);
 });
 
 test('T-F7/T-F8 view: requery bar shows confirms only, with estimate, $ and hint', () => {

@@ -39,7 +39,7 @@ test('prompts: media parts and message order', () => {
     const parts = buildMediaParts({ mode: 'frontend', frames: ['data:a', 'data:b'], fps: 0.5, audioB64: 'UklG' });
     assert.deepEqual(parts.map(p => p.type), ['text', 'image_url', 'text', 'image_url', 'input_audio']);
     assert.equal(parts[2].text, '[t=0:02]');
-    assert.deepEqual(buildMediaParts({ mode: 'backend', videoUrl: 'u' }), [{ type: 'input_video', video_url: { url: 'u' } }]);
+    assert.deepEqual(buildMediaParts({ mode: 'backend', videoUrl: 'u' }), [{ type: 'input_video', input_video: { url: 'u' } }]);
     const e = extractionMessages({ capsule: 'cap', mediaParts: parts, questions: [{ id: 'q1', text: 'who?' }], checklist: ['x'] });
     assert.equal(e[0].role, 'system');
     assert.match(e[1].content.at(-2).text, /q1: who\?/);

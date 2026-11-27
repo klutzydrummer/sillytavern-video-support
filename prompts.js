@@ -139,7 +139,7 @@ export function buildCapsule(ctx, { capsuleTokens, capsuleMessages }) {
  *   videoUrl?: string}} m
  */
 export function buildMediaParts(m) {
-    if (m.mode === 'backend' && m.videoUrl) return [{ type: 'input_video', video_url: { url: m.videoUrl } }];
+    if (m.mode === 'backend' && m.videoUrl) return [{ type: 'input_video', input_video: { url: m.videoUrl } }];
     const parts = [];
     const fps = Number(m.fps) > 0 ? Number(m.fps) : 1;
     (m.frames || []).forEach((url, i) => {
