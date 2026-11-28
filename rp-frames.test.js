@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     MAX_KEY_FRAMES, framesBudget, dossierDuration, uniformFrameTimes, selectFrameTimes, frameCaption,
     decideFramesForTurn, requestedFrameTimes, REQUESTED_WHY, buildFrameParts, frameAtArgs, createKeyFrameCache, appendPartsToLastUser,
+    AUTO_CONTINUE_MAX, decideAutoContinue,
 } from './video-utils.js';
 import { defaultSettings } from './settings.js';
 
@@ -159,4 +160,28 @@ test('F-B: decideFramesForTurn: tag-requested frames beat the button and t2; the
     assert.deepEqual(decideFramesForTurn({ ...base, requested: req, replyToMedia: true }), { reason: 'first', frames: sel });
     assert.deepEqual(decideFramesForTurn({ ...base, requested: req, rpImages: false }), { reason: 'off', frames: [] });
     assert.equal(decideFramesForTurn({ ...base, requested: [], userAsked: true }).reason, 'asked', 'empty list = no tag');
+});
+
+test('F-C: decideAutoContinue fires on a resolved tag, capped at 2 per user message', () => {
+    assert.equal(AUTO_CONTINUE_MAX, 2);
+    const a = { resolved: 1, framesOn: true, genType: 'normal' };
+    let r = decideAutoContinue({ ...a, count: 0 });
+    assert.deepEqual(r, { fire: true, count: 1, why: 'frames requested' });
+    r = decideAutoContinue({ ...a, count: r.count });
+    assert.deepEqual(r, { fire: true, count: 2, why: 'frames requested' });
+    r = decideAutoContinue({ ...a, count: r.count });
+    assert.deepEqual(r, { fire: false, count: 2, why: 'cap reached' });
+    // a real user message resets the caller's count to 0
+    assert.equal(decideAutoContinue({ ...a, count: 0 }).fire, true);
+    assert.equal(decideAutoContinue({ ...a, count: 0, max: 0 }).fire, false);
+});
+
+test('F-C: decideAutoContinue does not fire without a resolved tag, with frames off, or on quiet/dry runs', () => {
+    const a = { resolved: 1, framesOn: true, genType: 'normal', count: 0 };
+    assert.equal(decideAutoContinue({ ...a, resolved: 0 }).why, 'no resolved tag');
+    assert.equal(decideAutoContinue({ ...a, framesOn: false }).why, 'frames off');
+    assert.equal(decideAutoContinue({ ...a, genType: 'quiet' }).why, 'not a chat reply');
+    assert.equal(decideAutoContinue({ ...a, dryRun: true }).why, 'not a chat reply');
+    assert.equal(decideAutoContinue({ ...a, genType: null }).fire, true);   // unknown type = normal send
+    assert.equal(decideAutoContinue({ ...a, count: -3 }).count, 1);
 });

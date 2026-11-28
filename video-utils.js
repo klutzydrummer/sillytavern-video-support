@@ -219,6 +219,26 @@ export function requestedFrameTimes(times, k, durationHint = null) {
     return out;
 }
 
+/** Most automatic follow-up generations after <frames/> tags per user message (Fold 7: capped auto-continue). */
+export const AUTO_CONTINUE_MAX = 2;
+
+/**
+ * Whether an RP reply's resolved <frames/> tags start an automatic follow-up generation
+ * that carries those frames. `count` = auto-continues already done since the last real
+ * user message (the caller resets it to 0 on MESSAGE_SENT).
+ * @param {{ resolved: number, framesOn: boolean, count: number, genType?: string|null, dryRun?: boolean, max?: number }} a
+ * @returns {{ fire: boolean, count: number, why: string }}
+ */
+export function decideAutoContinue(a) {
+    const count = Math.max(0, Number(a.count) || 0);
+    const max = a.max ?? AUTO_CONTINUE_MAX;
+    if (!(a.resolved > 0)) return { fire: false, count, why: 'no resolved tag' };
+    if (!a.framesOn) return { fire: false, count, why: 'frames off' };
+    if (!isInjectableGenType(a.genType, !!a.dryRun)) return { fire: false, count, why: 'not a chat reply' };
+    if (count >= max) return { fire: false, count, why: 'cap reached' };
+    return { fire: true, count: count + 1, why: 'frames requested' };
+}
+
 /** Caption sent as text before each frame: "t=12.0 s: why". */
 export function frameCaption(t, why = '') {
     const w = String(why || '').trim();

@@ -37,6 +37,7 @@ import {
     buildFrameParts,
     frameAtArgs,
     createKeyFrameCache,
+    decideAutoContinue,
 } from './video-utils.js';
 import { createStore, runStorageSelfTest } from './dossier-store.js';
 import { sha256 } from './hash.js';
@@ -610,6 +611,7 @@ function findLastUserMessage(messages) {
 // ---------------------------------------------------------------------------
 
 async function onMessageSent(messageId) {
+    autoContinue.count = 0; autoContinue.pending = false; // a real user message starts a new turn
     if (!pendingVideo) return;
 
     const { dataUrl, fileName } = pendingVideo;
@@ -709,6 +711,7 @@ const storageAdapter = {
 const dossierStore = createStore(storageAdapter);
 
 async function onChatChanged() {
+    autoContinue.count = 0; autoContinue.pending = false;
     transcriptCache.clear();
     lastDecisions = [];
     renderRequeryBar();
@@ -752,6 +755,30 @@ const transcriptCache = createTranscriptCache(dossierStore);
 const framesRequested = new Map();
 let rtrInfo = { rpVision: null, coSet: null, gpu: null, prefillRpS: null }; // last RTR extras seen
 let lastDecisions = [];
+// Capped auto-continue after <frames/> tags (Fold 7): count since the last user message,
+// pending = fire once the current generation has ended.
+const autoContinue = { count: 0, pending: false };
+
+/**
+ * Start a normal generation, as the Send button does, so the RP gets the frames it asked for.
+ * Uses /trigger (documented in the STscript reference) through
+ * getContext().executeSlashCommandsWithOptions (present in ST's st-context.js; not in the
+ * extension docs). [U] not run inside a live ST.
+ */
+async function triggerGeneration() {
+    const ctx = stContext();
+    if (typeof ctx.executeSlashCommandsWithOptions !== 'function') throw new Error('executeSlashCommandsWithOptions unavailable');
+    await ctx.executeSlashCommandsWithOptions('/trigger');
+}
+
+/** Fire a pending auto-continue once no generation is running (MESSAGE_RECEIVED comes before GENERATION_ENDED [U]). */
+function maybeAutoContinue() {
+    if (!autoContinue.pending || currentGenType !== null) return;
+    autoContinue.pending = false;
+    setTimeout(() => {
+        triggerGeneration().catch(err => console.error('[VideoSupport] Auto-continue for frames failed:', err));
+    }, 0);
+}
 
 function protocolActive() {
     return routingMode(settings()) === ROUTING_DOSSIER && !!String(settings().rtrBaseUrl || '').trim();
@@ -955,11 +982,13 @@ async function addRpFrames(body, items, tiers, ownedUrl) {
 
 /**
  * RP reply done: strip <media_q> and <frames>, queue, then auto / confirm per item.
- * <frames> requests become one-shot frame requests for the next reply (no auto-continue);
- * they are ignored (still stripped) while the RP is not set to take frames. [U] runs after streaming ends.
+ * Resolved <frames> requests become one-shot frame requests and start an automatic follow-up
+ * generation right away (capped, decideAutoContinue); they are ignored (still stripped) while
+ * the RP is not set to take frames. [U] runs after streaming ends.
  */
 async function onMessageReceived(messageId) {
     if (!protocolActive()) return;
+    const genType = currentGenType, genDryRun = currentGenDryRun;
     const msg = chat[messageId];
     if (!msg || msg.is_user || typeof msg.mes !== 'string') return;
     let out;
@@ -981,6 +1010,13 @@ async function onMessageReceived(messageId) {
             framesRequested.set(f.itemId, [...(Array.isArray(prev) ? prev : []), ...f.times]);
         }
         if (settings().debug) console.debug('[VideoSupport] RP asked for frames', out.frames);
+    }
+    const ac = decideAutoContinue({ resolved: out.frames?.length || 0, framesOn: rpFramesOn(), count: autoContinue.count, genType, dryRun: genDryRun });
+    if (ac.fire) {
+        autoContinue.count = ac.count; autoContinue.pending = true;
+        maybeAutoContinue();
+    } else if (out.frames?.length && ac.why === 'cap reached') {
+        toastr.info('The roleplay model asked for more frames; they go with your next message.', 'Video Support');
     }
     lastDecisions = out.decisions;
     renderRequeryBar();
@@ -1372,8 +1408,7 @@ jQuery(async () => {
         currentGenType = type || 'normal';
         currentGenDryRun = !!dryRun;
     });
-    for (const ev of [event_types.GENERATION_ENDED, event_types.GENERATION_STOPPED]) {
-        eventSource.on(ev, () => { currentGenType = null; });
-    }
+    eventSource.on(event_types.GENERATION_ENDED, () => { currentGenType = null; maybeAutoContinue(); });
+    eventSource.on(event_types.GENERATION_STOPPED, () => { currentGenType = null; autoContinue.pending = false; });
     console.log('[VideoSupport] Loaded');
 });
