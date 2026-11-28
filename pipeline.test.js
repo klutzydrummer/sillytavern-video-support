@@ -15,13 +15,14 @@ const A = 'a'.repeat(64), B = 'b'.repeat(64);
  * Whole protocol on stubs. `mode` drives the fake RTR (dry run and real calls);
  * `lfmReason` is the plan reason the fake gives for LFM3 dry runs.
  */
-function harness({ mode = 'coexist', lfmReason = 'no coexist set for this RP and media model', settings = {}, fail = null } = {}) {
+function harness({ mode = 'coexist', lfmReason = 'no coexist set for this RP and media model', settings = {}, fail = null, extras = null, repaired } = {}) {
     const st = fakeST();
     const store = createStore(st);
     const rtrFetch = fakeRtrFetch((body) => {
         const r = body.rtr;
         if (r.dry_run) {
             if (r.media_model === LFM) return planRes('swap', { reason: lfmReason });
+            if (extras) return rtrOk({ status: 'plan', plan: planRes(mode).json.rtr.plan, ...extras });
             return planRes(mode);
         }
         if (fail) return fail;
@@ -30,10 +31,12 @@ function harness({ mode = 'coexist', lfmReason = 'no coexist set for this RP and
             : { extract_s: 8, total_s: 8, flush_s: 2 };
         const result = r.kind === 'dossier' ? sampleDossier(r.media_model.slice(0, 4))
             : { answers: [{ id: 'f1-1', answer: 'EXIT', confidence: 0.8 }], timeline_add: [{ t0: 7, kind: 'speech', speaker: 'Owner', text: 'Get out' }, { t0: 6, kind: 'visual', text: 'sign' }], uncertain: [] };
-        const flushed = (r.flush || []).map(f => ({ id: f.id, status: 'ok', errors: [], delta: { answers: [{ id: 'pb', answer: `piggy ${f.id.slice(0, 2)}`, confidence: 0.5 }] } }));
+        const flushed = (r.flush || []).map(f => ({ id: f.id, status: 'ok', errors: [], delta: { answers: [{ id: 'pb', answer: `piggy ${f.id.slice(0, 2)}`, confidence: 0.5 }] },
+            ...(repaired === undefined ? {} : { repaired }) }));
         return rtrOk({ kind: r.kind, media_model: r.media_model, rp_model: 'rp', mode, plan: { mode, would_evict: [] }, timings, status: 'ok', result,
             usage: { completion_tokens: 400 }, llama_timings: { prompt_ms: 4000, predicted_ms: 4000, predicted_n: 400 }, flushed,
-            mmproj_sha256: 'mm1', llama_build: 'b9000' });
+            mmproj_sha256: 'mm1', llama_build: 'b9000', ...(extras || {}),
+            ...(extras?.prefill_rp_s !== undefined ? { timings: { ...timings, prefill_rp_s: extras.prefill_rp_s } } : {}) });
     });
     const rtr = createRtrClient({ fetch: rtrFetch.fetch, baseUrl: 'http://box' });
     const asked = [];
@@ -41,6 +44,7 @@ function harness({ mode = 'coexist', lfmReason = 'no coexist set for this RP and
     let stats = {};
     const statuses = [];
     const media = [];
+    const info = [];
     const proto = createProtocol({
         store, rtr,
         askQuestions: async (req) => { asked.push(req); return JSON.stringify({ questions: [{ id: 'q1', text: 'Who is in it?' }], needs_for_next_reply: 'names' }); },
@@ -51,9 +55,10 @@ function harness({ mode = 'coexist', lfmReason = 'no coexist set for this RP and
         gpu: () => 'RTX 4090',
         knownMmproj: (id) => mmproj.get(id), rememberMmproj: (id, sha) => mmproj.set(id, sha),
         onStatus: (id, s) => statuses.push([id, s]),
+        onRtrInfo: (x) => info.push(x),
     });
     const runs = () => rtrFetch.calls.filter(c => !c.body.rtr.dry_run);
-    return { st, store, proto, rtrFetch, runs, asked, mmproj, statuses, media, getStats: () => stats };
+    return { st, store, proto, rtrFetch, runs, asked, mmproj, statuses, media, info, getStats: () => stats };
 }
 
 test('protocol: first pass, then cache hit never calls the media model (no re-send)', async () => {
@@ -222,4 +227,58 @@ test('protocol: RTR busy / step failure stores nothing and reports an error', as
     await h2.proto.registerItem({ id: A });
     assert.equal((await h2.proto.ensureDossier(A)).status, 'failed');
     assert.equal(h2.getStats()[`${Q8}|RTX 4090`].load_s.v, 9, 'timings of a failed step still feed the averages');
+});
+
+test('F-B: <frames> tag stripped with <media_q>, resolved to items; fallback = the only item', async () => {
+    const h = harness({ mode: 'swap' });
+    await h.proto.registerItem({ id: A, title: 'a.mp4' });
+    await h.proto.ensureDossier(A);
+    const out = await h.proto.afterRpTurn({ text: `She squints. <frames t="12.5,40"/> <media_q item="${A.slice(0, 8)}">Sign?</media_q>\n<frames item="${A.slice(0, 8)}" t="1:05"/>`, turn: 1 });
+    assert.equal(out.text, 'She squints.');
+    assert.deepEqual(out.frames, [{ itemId: A, times: [12.5, 40, 65] }], 'no item → the only item; times merged per item');
+    assert.equal(h.store.getItem(A).pending.length, 1, '<media_q> still queued');
+    await h.proto.registerItem({ id: B, title: 'b.mp4' });
+    await h.proto.ensureDossier(B);
+    const two = await h.proto.afterRpTurn({ text: `<frames t="3"/><frames item="${B.slice(0, 8)}" t="4"/>ok`, turn: 2 });
+    assert.equal(two.text, 'ok');
+    assert.deepEqual(two.frames, [{ itemId: B, times: [4] }], 'two items and no item named → that tag is dropped');
+    const act = await h.proto.afterRpTurn({ text: '<frames t="3"/>ok', turn: 3, activeItemId: A });
+    assert.deepEqual(act.frames, [{ itemId: A, times: [3] }]);
+    assert.deepEqual((await h.proto.afterRpTurn({ text: 'plain', turn: 4 })).frames, []);
+});
+
+test('F-B: RTR extras reach onRtrInfo from plans and results; older RTR gives nulls', async () => {
+    const gpu = { name: 'RTX 4090', total_mb: 24564, free_mb: 20000, need_mb: 9000, margin_mb: 1024 };
+    const h = harness({ mode: 'swap', extras: { rp_vision: true, co_set: null, gpu, prefill_rp_s: 3.5 } });
+    await h.proto.registerItem({ id: A, title: 'a.mp4' });
+    await h.proto.ensureDossier(A);
+    const got = h.info.filter(x => x.rpVision !== null); // the LFM comparison plan is the fake's older-RTR shape
+    assert.ok(got.length >= 2);
+    assert.ok(got.every(x => x.rpVision === true && x.coSet === null && x.gpu?.name === 'RTX 4090'));
+    assert.equal(h.info.at(-1).prefillRpS, 3.5, 'the run result carries timings.prefill_rp_s');
+    assert.equal(h.getStats()['rp|RTX 4090'].prefill_ctx_s.v, 3.5, 'learned as the RP re-prefill term');
+    const pv = await h.proto.preview(h.proto.itemModel(h.store.getItem(A)), 'dossier', 10);
+    assert.equal(pv.plan.rp_vision, true);
+    assert.equal(pv.estimate.terms.find(t => t.name === 't_rp_prefill').s, 3.5);
+    const old = harness({ mode: 'swap' });
+    await old.proto.registerItem({ id: A });
+    await old.proto.ensureDossier(A);
+    assert.ok(old.info.length >= 1);
+    assert.ok(old.info.every(x => x.rpVision === null && x.coSet === null && x.gpu === null && x.prefillRpS === null));
+    assert.equal(old.getStats()['rp|RTX 4090']?.prefill_ctx_s, undefined);
+});
+
+test('F-B: flushed[].repaired is kept on the piggyback requery record; absent from older RTR', async () => {
+    for (const repaired of [true, undefined]) {
+        const h = harness({ mode: 'swap', repaired });
+        await h.proto.registerItem({ id: A, title: 'a.mp4' });
+        await h.proto.registerItem({ id: B, title: 'b.mp4' });
+        await h.proto.ensureDossier(A);
+        await h.proto.ensureDossier(B);
+        await h.proto.afterRpTurn({ text: `<media_q item="${B.slice(0, 8)}">Is there a dog?</media_q>`, turn: 1 });
+        await h.proto.ask(A, ['What time is it?']);
+        const rec = h.store.activeVersion(B).provenance.requeries[0];
+        if (repaired === undefined) assert.equal('repaired' in rec, false);
+        else assert.equal(rec.repaired, true);
+    }
 });

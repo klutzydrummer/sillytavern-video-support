@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { injectTiers, progressText, requeryBarModel, itemCardModel, parseQuestionLines, routingMode } from './protocol-view.js';
+import { injectTiers, progressText, rtrExtrasText, rpVisionHint, requeryBarModel, itemCardModel, parseQuestionLines, routingMode } from './protocol-view.js';
 
 const A = 'a'.repeat(64);
 
@@ -46,4 +46,35 @@ test('view: item card has dropdown, badges and actions only with a dossier', () 
     assert.equal(has.canRegenerate, true);
     assert.deepEqual(has.badges.map(b => b.text), ['LFM3-Omni 2B', 'stale', '1 question pending']);
     assert.deepEqual(parseQuestionLines(' a \n\n b\n'), ['a', 'b']);
+});
+
+test('F-B: injectTiers passes the frames flag to the follow-up instruction', () => {
+    const on = { messages: [{ role: 'user', content: 'hi' }] };
+    injectTiers(on, { handles: ['abcd1234'], frames: true });
+    assert.match(on.messages[0].content, /<frames item=/);
+    const off = { messages: [{ role: 'user', content: 'hi' }] };
+    injectTiers(off, { handles: ['abcd1234'] });
+    assert.doesNotMatch(off.messages[0].content, /<frames/);
+});
+
+test('F-B: rtrExtrasText shows co_set and GPU VRAM; empty for older RTR', () => {
+    assert.equal(rtrExtrasText({ mode: 'swap' }), '');
+    assert.equal(rtrExtrasText(null), '');
+    assert.equal(rtrExtrasText({ co_set: null, gpu: null }), '');
+    assert.equal(rtrExtrasText({ co_set: 'rp+lfm3', gpu: { name: 'RTX 4090', free_mb: 20480, need_mb: 9216 } }), 'set rp+lfm3 · RTX 4090 20 GiB free / 9 GiB needed');
+    assert.equal(rtrExtrasText({ gpu: { name: 'A10', free_mb: 1024 } }), 'A10 1 GiB free / ? needed');
+});
+
+test('F-B: progressText appends the RTR extras when present', () => {
+    const pv = { mode: 'swap', estimate: { label: '~1 min' }, dollars: null, plan: { mode: 'swap', co_set: 'rp+lfm3' } };
+    assert.equal(progressText(pv), 'Media pass (model swap): ~1 min · set rp+lfm3');
+    assert.equal(progressText({ ...pv, plan: { mode: 'swap' } }), 'Media pass (model swap): ~1 min');
+});
+
+test('F-B: rpVisionHint is advice only; the setting stays the authority', () => {
+    assert.equal(rpVisionHint({ rpVision: true, rpAcceptsImages: false }).tone, 'info');
+    assert.equal(rpVisionHint({ rpVision: false, rpAcceptsImages: true }).tone, 'warn');
+    assert.equal(rpVisionHint({ rpVision: true, rpAcceptsImages: true }), null);
+    assert.equal(rpVisionHint({ rpVision: false, rpAcceptsImages: false }), null);
+    assert.equal(rpVisionHint({ rpVision: null, rpAcceptsImages: true }), null, 'older RTR: no hint');
 });

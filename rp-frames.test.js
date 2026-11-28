@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
     MAX_KEY_FRAMES, framesBudget, dossierDuration, uniformFrameTimes, selectFrameTimes, frameCaption,
-    decideFramesForTurn, buildFrameParts, frameAtArgs, createKeyFrameCache, appendPartsToLastUser,
+    decideFramesForTurn, requestedFrameTimes, REQUESTED_WHY, buildFrameParts, frameAtArgs, createKeyFrameCache, appendPartsToLastUser,
 } from './video-utils.js';
 import { defaultSettings } from './settings.js';
 
@@ -139,4 +139,24 @@ test('frame parts land on the last user message; no audio or video parts', () =>
     assert.deepEqual(types, ['text', 'text', 'image_url', 'text', 'image_url', 'text', 'image_url']);
     assert.equal(body.messages[1].content[1].text, 't=30.0 s: w0');
     assert.ok(!types.includes('input_audio') && !types.includes('input_video'));
+});
+
+test('F-B: requestedFrameTimes clamps to K (max 6), dedupes, drops times past the end', () => {
+    assert.deepEqual(requestedFrameTimes([12.5, 40], 3, 60), [{ t: 12.5, why: REQUESTED_WHY }, { t: 40, why: REQUESTED_WHY }]);
+    assert.deepEqual(requestedFrameTimes([1, 2, 3, 4], 2, 60).map(f => f.t), [1, 2]);
+    assert.equal(requestedFrameTimes([1, 2, 3, 4, 5, 6, 7, 8], 10, 100).length, 6);
+    assert.deepEqual(requestedFrameTimes([5, 5.01, 5, 70, -1, 'x', 9], 6, 60).map(f => f.t), [5, 9]);
+    assert.deepEqual(requestedFrameTimes([500], 3, null).map(f => f.t), [500], 'no duration → no end check');
+    assert.deepEqual(requestedFrameTimes([1], 0, 60), []);
+    assert.deepEqual(requestedFrameTimes(null, 3, 60), []);
+});
+
+test('F-B: decideFramesForTurn: tag-requested frames beat the button and t2; the first reply still wins', () => {
+    const req = requestedFrameTimes([7, 8, 9, 10], 6, 60);
+    assert.deepEqual(decideFramesForTurn({ ...base, requested: req }), { reason: 'requested', frames: req.slice(0, 3) });
+    assert.equal(decideFramesForTurn({ ...base, requested: req, userAsked: true }).reason, 'requested');
+    assert.equal(decideFramesForTurn({ ...base, requested: req, citedTimes: [12], t2Hits: 1 }).reason, 'requested');
+    assert.deepEqual(decideFramesForTurn({ ...base, requested: req, replyToMedia: true }), { reason: 'first', frames: sel });
+    assert.deepEqual(decideFramesForTurn({ ...base, requested: req, rpImages: false }), { reason: 'off', frames: [] });
+    assert.equal(decideFramesForTurn({ ...base, requested: [], userAsked: true }).reason, 'asked', 'empty list = no tag');
 });

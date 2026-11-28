@@ -9,6 +9,8 @@
  */
 
 const MEDIA_Q_RE = /<media_q\b([^>]*)>([\s\S]*?)<\/media_q>/gi;
+/** <frames t="12.5,40" item="…"/> (P7 #6 option C). Self-closing, or with an empty closing tag. */
+const FRAMES_RE = /<frames\b((?:[^>"']|"[^"]*"|'[^']*')*?)\/?>(?:\s*<\/frames>)?/gi;
 const ATTR_RE = /(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
 
 /** Jaccard similarity on normalised words at or above which two questions are the same. [I] */
@@ -39,6 +41,41 @@ export function parseMediaQ(message) {
         .replace(/\n{3,}/g, '\n\n')
         .trim();
     return { text, questions };
+}
+
+/**
+ * One time from a <frames> tag: seconds ("12.5", "12.5s") or clock form ("1:05", "1:02:03.5").
+ * @returns {number|null}  null when it is not a time of zero or more
+ */
+export function parseFrameTime(tok) {
+    const s = String(tok ?? '').trim().toLowerCase().replace(/\s*s(ec)?$/, '');
+    if (!s) return null;
+    if (/^\d+(?:\.\d+)?$/.test(s)) return Number(s);
+    const m = s.match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$/);
+    if (!m || Number(m[3]) >= 60 || (m[1] && Number(m[2]) >= 60)) return null;
+    return (Number(m[1] || 0) * 3600) + Number(m[2]) * 60 + Number(m[3]);
+}
+
+/**
+ * Parse and strip <frames t="…" item="…"/> tags: the RP asks for frames at these
+ * times on the next reply. Invalid times are dropped; a tag with no valid time is
+ * stripped and ignored. Clamping to the frame budget is the caller's job.
+ * @returns {{text: string, requests: Array<{item: string, times: number[]}>}}
+ */
+export function parseFramesTag(message) {
+    const src = String(message ?? '');
+    const requests = [];
+    for (const m of src.matchAll(FRAMES_RE)) {
+        const a = attrs(m[1]);
+        const times = String(a.t ?? a.times ?? '').split(/[,;\s]+/).map(parseFrameTime).filter(t => t !== null);
+        if (!times.length) continue;
+        requests.push({ item: a.item || '', times });
+    }
+    const text = src.replace(FRAMES_RE, '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    return { text, requests };
 }
 
 /** Text without tags; a cheap check for callers that only display. */
@@ -187,10 +224,12 @@ export function mergeDelta(dossier, delta) {
     return { dossier: d, speech };
 }
 
-/** The requeries[] record for one flushed batch. */
-export function requeryRecord({ questions, mediaModel, status, at, wallS, trigger, transcript = null }) {
+/** The requeries[] record for one flushed batch. `repaired` is kept only when RTR reports it. */
+export function requeryRecord({ questions, mediaModel, status, at, wallS, trigger, transcript = null, repaired }) {
     return {
         at, media_model: mediaModel, status, trigger, wall_s: wallS ?? null,
+        // RTR's JSON repair pass ran on this answer (flushed[].repaired); absent from older RTR.
+        ...(typeof repaired === 'boolean' ? { repaired } : {}),
         questions: (questions || []).map(q => ({ id: q.id, text: q.text, blocking: !!q.blocking })),
         transcript,
     };

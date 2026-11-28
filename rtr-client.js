@@ -4,12 +4,31 @@
  * POST {base}/v1/chat/completions, model "media-dossier", top-level
  * rtr: {media_model, rp_model?, kind, dry_run?, flush?}. A 200 carries the result
  * in `rtr`; a failed step is 502 {error:{step}, rtr}; a held lock is 503; a bad
- * request is 400. Fetch is injected so tests stub it.
+ * request is 400. Newer RTR adds rp_vision, co_set, gpu, timings.prefill_rp_s and
+ * flushed[].repaired; all are optional here. Fetch is injected so tests stub it.
  *
  * Pure module: no SillyTavern imports.
  */
 
 export const RTR_MODEL = 'media-dossier';
+
+/** Top-level result fields newer RTR adds (vastai fa-report Item 4). Any may be missing. */
+export const RTR_EXTRAS = ['rp_vision', 'co_set', 'gpu'];
+
+/**
+ * The RTR extras from a result or merged plan, normalised; missing → null.
+ * @returns {{rpVision: boolean|null, coSet: string|null, gpu: object|null, prefillRpS: number|null}}
+ */
+export function rtrExtras(res) {
+    const r = res && typeof res === 'object' ? res : {};
+    const p = Number(r.timings?.prefill_rp_s);
+    return {
+        rpVision: typeof r.rp_vision === 'boolean' ? r.rp_vision : null,
+        coSet: typeof r.co_set === 'string' && r.co_set ? r.co_set : null,
+        gpu: r.gpu && typeof r.gpu === 'object' ? r.gpu : null,
+        prefillRpS: r.timings?.prefill_rp_s != null && Number.isFinite(p) && p >= 0 ? p : null,
+    };
+}
 
 export class RtrError extends Error {
     constructor(message, { kind, status = null, step = null, res = null } = {}) {
@@ -78,10 +97,16 @@ export function createRtrClient({ fetch, baseUrl, headers, timeoutMs = 0 }) {
 
     return {
         url,
-        /** Dry run: the plan only (mode, would_evict, reason). No model is touched. */
+        /**
+         * Dry run: the plan (mode, would_evict, reason) plus the RTR extras rp_vision,
+         * co_set and gpu when this RTR reports them (older RTR: absent). No model is touched.
+         */
         async plan({ mediaModel, rpModel }) {
             const res = await post(body({ mediaModel, rpModel, kind: 'dossier', dryRun: true }));
-            return res.plan || res;
+            if (!res.plan) return res;
+            const out = { ...res.plan };
+            for (const k of RTR_EXTRAS) if (k in res && !(k in out)) out[k] = res[k];
+            return out;
         },
         /** First pass or requery. Returns the full rtr result. */
         async run({ messages, mediaModel, rpModel, kind, maxTokens, flush }) {

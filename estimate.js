@@ -70,6 +70,8 @@ export function recordTimings(stats, res, ctx) {
     if (genS !== null && outTok) put(mm, 'gen_per_token_s', genS / outTok);
     // Without llama timings, fall back to extract_s as one lump for this model.
     if (promptS === null && genS === null) put(mm, 'extract_s', num(t.extract_s));
+    // Newer RTR times the RP re-read after a swap reload (null in coexist / when kept).
+    if (swap) put(rp, 'prefill_ctx_s', num(t.prefill_rp_s));
     return out;
 }
 
@@ -101,7 +103,7 @@ export function estimate(stats, q) {
     if (q.mode === 'swap') {
         terms.push({ name: 't_unload_mm', s: v(mm, 'unload_s') });
         terms.push({ name: 't_load_rp', s: v(rp, 'load_s') });
-        // RTR does not time the RP re-prefill; stays unknown until measured (Open fork).
+        // Learned from RTR timings.prefill_rp_s when RTR re-reads the chat; unknown until then.
         terms.push({ name: 't_rp_prefill', s: v(rp, 'prefill_ctx_s') });
     }
     const known = terms.every(t => t.s !== null);
@@ -129,13 +131,15 @@ export function formatDollars(d) {
 }
 
 /**
- * Does an LFM3 coexist set exist for this RP? RTR's plan carries no explicit
- * field, so this reads it from the plan reason [U]; `coSets` from settings or a
- * future RTR field wins when given (Open fork: ask RTR for `co_set`).
+ * Does an LFM3 coexist set exist for this RP? Newer RTR reports `co_set` (the set
+ * name, or null for none); older RTR does not, so this falls back to the plan
+ * reason [U]. `coSets` from settings wins when given.
  */
 export function coexistSetExists(plan, { coSets } = {}) {
     if (Array.isArray(coSets)) return coSets.length > 0;
     if (plan && typeof plan.co_set === 'boolean') return plan.co_set;
+    if (plan && typeof plan.co_set === 'string') return plan.co_set.length > 0;
+    if (plan && 'co_set' in plan && plan.co_set === null) return false;
     // rtr.py plan(): only 'no coexist set…' and 'no RP loaded' say nothing about a set;
     // every later branch ('free VRAM … unknown', 'live free …', 'coexist set and live
     // VRAM fit') is reached only when the set exists, even when it falls back to swap.

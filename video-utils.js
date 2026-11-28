@@ -194,6 +194,31 @@ export function selectFrameTimes(keyFrames, k, durationHint = null) {
     return uniformFrameTimes(n, d).map(t => ({ t, why: '' }));
 }
 
+/** Caption `why` for frames the RP asked for with a <frames> tag. */
+export const REQUESTED_WHY = 'requested by the roleplay model';
+
+/**
+ * Explicit times from a <frames> tag (P7 #6 option C), clamped to the frame budget:
+ * at most K (≤ 6), deduped at 0.1 s, past-the-end times dropped when the duration is known.
+ * @returns {Array<{t: number, why: string}>}
+ */
+export function requestedFrameTimes(times, k, durationHint = null) {
+    const n = Math.max(0, Math.min(MAX_KEY_FRAMES, Math.floor(Number(k) || 0)));
+    const d = validTime(durationHint);
+    const out = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(times) ? times : []) {
+        if (out.length >= n) break;
+        const t = validTime(raw);
+        if (t === null || (d !== null && t > d)) continue;
+        const r = roundTime(t);
+        if (seen.has(r)) continue;
+        seen.add(r);
+        out.push({ t: r, why: REQUESTED_WHY });
+    }
+    return out;
+}
+
 /** Caption sent as text before each frame: "t=12.0 s: why". */
 export function frameCaption(t, why = '') {
     const w = String(why || '').trim();
@@ -205,9 +230,12 @@ export function frameCaption(t, why = '') {
  * toggle is on. The reply to the message that owns the media (incl. regenerate/swipe)
  * gets the selected frames; later turns only on a user request, or when the user
  * cites a timestamp that a T2 slice matched (then the nearest key frame, else that time).
+ * `requested` (from the RP's <frames> tag, already clamped) wins over the user's
+ * button and timestamps, but not over the reply right after processing.
  * @param {{rpImages: boolean, enabled: boolean, k: number, selected: Array<{t:number, why:string}>,
- *   replyToMedia?: boolean, userAsked?: boolean, citedTimes?: number[], t2Hits?: number}} a
- * @returns {{reason: 'off'|'first'|'asked'|'t2'|'none', frames: Array<{t:number, why:string}>}}
+ *   replyToMedia?: boolean, userAsked?: boolean, requested?: Array<{t:number, why:string}>,
+ *   citedTimes?: number[], t2Hits?: number}} a
+ * @returns {{reason: 'off'|'first'|'requested'|'asked'|'t2'|'none', frames: Array<{t:number, why:string}>}}
  */
 export function decideFramesForTurn(a) {
     if (!a?.rpImages || !a.enabled) return { reason: 'off', frames: [] };
@@ -215,6 +243,7 @@ export function decideFramesForTurn(a) {
     const sel = (a.selected || []).slice(0, k);
     if (!k) return { reason: 'none', frames: [] };
     if (a.replyToMedia) return { reason: 'first', frames: sel };
+    if (a.requested?.length) return { reason: 'requested', frames: a.requested.slice(0, k) };
     if (a.userAsked) return { reason: 'asked', frames: sel };
     const cited = (a.citedTimes || []).map(validTime).filter(t => t !== null);
     if (cited.length && (a.t2Hits || 0) > 0) {

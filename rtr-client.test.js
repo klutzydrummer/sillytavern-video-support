@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createRtrClient, RtrError, describeRtrError, RTR_MODEL } from './rtr-client.js';
+import { createRtrClient, RtrError, describeRtrError, RTR_MODEL, rtrExtras } from './rtr-client.js';
 import { fakeRtrFetch, rtrOk, planRes } from './testing-stubs.js';
 
 test('rtr client: request body follows the P3 contract', async () => {
@@ -60,4 +60,23 @@ test('rtr client: real HTTP round trip against a tiny in-process server', async 
     } finally {
         server.close();
     }
+});
+
+test('F-B: plan() merges RTR top-level extras into the plan; older RTR plans are unchanged', async () => {
+    const gpu = { name: 'RTX 4090', total_mb: 24564, free_mb: 20000, need_mb: 9000, margin_mb: 1024 };
+    const f = fakeRtrFetch(() => rtrOk({ status: 'plan', plan: { mode: 'coexist', reason: 'coexist set and live VRAM fit' }, rp_vision: true, co_set: 'rp+lfm3', gpu }));
+    const plan = await createRtrClient({ fetch: f.fetch, baseUrl: 'http://box' }).plan({ mediaModel: 'M' });
+    assert.equal(plan.mode, 'coexist');
+    assert.equal(plan.rp_vision, true);
+    assert.equal(plan.co_set, 'rp+lfm3');
+    assert.deepEqual(plan.gpu, gpu);
+    const old = fakeRtrFetch(() => planRes('swap'));
+    const p2 = await createRtrClient({ fetch: old.fetch, baseUrl: 'http://box' }).plan({ mediaModel: 'M' });
+    for (const k of ['rp_vision', 'co_set', 'gpu']) assert.equal(k in p2, false, k);
+});
+
+test('F-B: rtrExtras reads the extras and gives null for anything missing or malformed', () => {
+    assert.deepEqual(rtrExtras(undefined), { rpVision: null, coSet: null, gpu: null, prefillRpS: null });
+    assert.deepEqual(rtrExtras({ rp_vision: 'yes', co_set: '', gpu: 'x', timings: { prefill_rp_s: null } }), { rpVision: null, coSet: null, gpu: null, prefillRpS: null });
+    assert.deepEqual(rtrExtras({ rp_vision: false, co_set: 'a+b', gpu: { name: 'g' }, timings: { prefill_rp_s: 2.5 } }), { rpVision: false, coSet: 'a+b', gpu: { name: 'g' }, prefillRpS: 2.5 });
 });

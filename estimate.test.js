@@ -72,3 +72,21 @@ test('T-F8: Q3b hint only on a swap with an LFM3 coexist set (OQ-E6)', () => {
     assert.equal(lfm3HintVisible({ mode: 'swap', mediaModel: MM, lfm3CoSet: false }), false);
     assert.equal(lfm3HintVisible({ mode: 'swap', mediaModel: 'LFM3-Omni-2B-Q8_0', lfm3CoSet: true }), false);
 });
+
+test('F-B: timings.prefill_rp_s fills t_rp_prefill on a swap; missing or coexist leaves it unknown', () => {
+    const q = { mode: 'swap', mediaModel: MM, rpModel: RP, gpu: GPU, mediaSeconds: 10, outTokens: 1000 };
+    const st = recordTimings({}, swapRes({ timings: { ...swapRes().timings, prefill_rp_s: 4 } }), { gpu: GPU, mediaSeconds: 10 });
+    const e = estimate(st, q);
+    assert.equal(e.known, true);
+    assert.equal(e.seconds, 77);
+    assert.equal(estimate(recordTimings({}, swapRes(), { gpu: GPU, mediaSeconds: 10 }), q).known, false);
+    const co = recordTimings({}, swapRes({ mode: 'coexist', timings: { extract_s: 8, prefill_rp_s: 4 } }), { gpu: GPU, mediaSeconds: 10 });
+    assert.equal(co[statKey(RP, GPU)]?.prefill_ctx_s, undefined);
+});
+
+test('F-B: coexistSetExists reads RTR co_set (string or null) before the reason text', () => {
+    assert.equal(coexistSetExists({ mode: 'swap', reason: 'live free VRAM too low', co_set: 'rp+lfm3' }), true);
+    assert.equal(coexistSetExists({ mode: 'swap', reason: 'live free VRAM too low', co_set: null }), false);
+    assert.equal(coexistSetExists({ mode: 'swap', reason: 'live free VRAM too low' }), true, 'older RTR: reason regex');
+    assert.equal(coexistSetExists({ co_set: null }, { coSets: ['x'] }), true, 'settings still win');
+});

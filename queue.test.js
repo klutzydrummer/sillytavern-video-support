@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMediaQ, enqueue, similarity, resolveItemRef, triggerMet, decideRequery, piggybackItems, mergeDelta, removeFlushed } from './queue.js';
+import { parseMediaQ, parseFramesTag, parseFrameTime, requeryRecord, enqueue, similarity, resolveItemRef, triggerMet, decideRequery, piggybackItems, mergeDelta, removeFlushed } from './queue.js';
 import { defaultSettings } from './settings.js';
 
 const S = defaultSettings();
@@ -99,4 +99,40 @@ test('T-F7: piggyback picks other items on the same model with a queue (Q31a)', 
     ];
     assert.deepEqual(piggybackItems(items, 'M', 'a'), ['d']);
     assert.deepEqual(piggybackItems(items, 'M'), ['a', 'd']);
+});
+
+test('F-B: parseFrameTime accepts seconds, "s" suffix and m:ss; rejects junk', () => {
+    assert.equal(parseFrameTime('12.5'), 12.5);
+    assert.equal(parseFrameTime('40s'), 40);
+    assert.equal(parseFrameTime('1:05'), 65);
+    for (const bad of ['x', '', '-3', '1:75', null]) assert.equal(parseFrameTime(bad), null, String(bad));
+});
+
+test('F-B: <frames/> tags are parsed and stripped (self-closing, paired, either quote, any order)', () => {
+    const out = parseFramesTag(`She looks. <frames t="12.5, 40s,1:05,x" item="abcd1234"/> Then <frames item='ef01' t='3'></frames>done.`);
+    assert.equal(out.text, 'She looks.  Then done.');
+    assert.deepEqual(out.requests, [{ item: 'abcd1234', times: [12.5, 40, 65] }, { item: 'ef01', times: [3] }]);
+    assert.deepEqual(parseFramesTag('<frames t="7"/>').requests, [{ item: '', times: [7] }]);
+    const none = parseFramesTag('No tag. <frames t="later"/>');
+    assert.deepEqual(none.requests, [], 'a tag with no valid time is dropped');
+    assert.equal(none.text, 'No tag.', 'but still stripped');
+    assert.deepEqual(parseFramesTag('plain text'), { text: 'plain text', requests: [] });
+});
+
+test('F-B: <frames> and <media_q> in one message: each parser strips only its own tag', () => {
+    const msg = 'A <media_q item="abcd">Sign?</media_q> B <frames t="5"/>';
+    const q = parseMediaQ(msg);
+    assert.equal(q.questions.length, 1);
+    assert.match(q.text, /<frames t="5"\/>/);
+    const f = parseFramesTag(q.text);
+    assert.deepEqual(f.requests, [{ item: '', times: [5] }]);
+    assert.equal(f.text, 'A  B');
+});
+
+test('F-B: requeryRecord keeps RTR flushed[].repaired only when it is a boolean', () => {
+    const base = { questions: [{ id: 'q', text: 'x' }], mediaModel: 'M', status: 'ok', at: 1, trigger: 't' };
+    assert.equal(requeryRecord({ ...base, repaired: true }).repaired, true);
+    assert.equal(requeryRecord({ ...base, repaired: false }).repaired, false);
+    assert.equal('repaired' in requeryRecord(base), false);
+    assert.equal('repaired' in requeryRecord({ ...base, repaired: 'yes' }), false);
 });

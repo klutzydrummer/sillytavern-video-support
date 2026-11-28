@@ -75,3 +75,14 @@ test('badges: stale shown (F14), transcript badges (OQ-E3, OQ-B4), pending', () 
     assert.deepEqual(t(itemBadges({ busy: { label: 'working' } })), ['working']);
     assert.equal(itemBadges({ error: 'boom' })[0].tone, 'bad');
 });
+
+test('F-B: PROMPT_VERSION is p6-2 (the <frames> tag joined the RP prompt)', () => {
+    assert.equal(PROMPT_VERSION, 'p6-2');
+});
+
+test('F-B: followUpInstruction names the <frames> tag only when frames are on', () => {
+    assert.doesNotMatch(followUpInstruction(['abcd1234']), /<frames/);
+    const on = followUpInstruction(['abcd1234'], { frames: true });
+    assert.match(on, /<frames item="ID" t="12\.5,40"\/>/);
+    assert.match(on, /<media_q item="ID"/);
+});

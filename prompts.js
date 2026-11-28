@@ -11,7 +11,7 @@
 import { tokens, clip, fmtTime } from './tiers.js';
 import { itemHandle } from './queue.js';
 
-export const PROMPT_VERSION = 'p6-1';
+export const PROMPT_VERSION = 'p6-2';
 
 export const MAX_QUESTIONS = 8;
 
@@ -53,15 +53,25 @@ export const PROMPT_DELTA = [
     'Reply only with JSON: {"answers":[...],"timeline_add":[...],"uncertain":[...]}',
 ].join('\n');
 
-/** F: appended to the RP prompt while any item has a dossier. */
-export function followUpInstruction(handles) {
+/**
+ * F: appended to the RP prompt while any item has a dossier. With `frames` (the RP
+ * takes images and key frames are on) it also explains the <frames> tag (P7 #6 option C).
+ */
+export function followUpInstruction(handles, { frames = false } = {}) {
     const list = (handles || []).map(h => `"${h}"`).join(', ');
-    return [
+    const out = [
         'If you need something about attached media that the dossier does not say, ask the media model by writing',
         '<media_q item="ID" blocking="true|false">your question</media_q>',
         `anywhere in your reply (ID is one of ${list || 'the media ids above'}). It is hidden from the user.`,
         'Use blocking="true" only when you cannot continue the scene well without the answer. Never guess at media details instead.',
-    ].join(' ');
+    ];
+    if (frames) {
+        out.push(
+            'To see still frames of a video, write <frames item="ID" t="12.5,40"/> with times in seconds from the start.',
+            'It is hidden from the user; the frames arrive with the next message, so do not describe them before you have seen them.',
+        );
+    }
+    return out.join(' ');
 }
 
 export function questionPrompt(maxQuestions = MAX_QUESTIONS, title = '') {

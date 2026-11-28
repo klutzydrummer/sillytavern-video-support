@@ -9,6 +9,7 @@ import { followUpInstruction } from './prompts.js';
 import { itemHandle } from './queue.js';
 import { dropdownOptions, itemBadges } from './media-models.js';
 import { formatDollars } from './estimate.js';
+import { rtrExtras } from './rtr-client.js';
 
 export const ROUTING_DOSSIER = 'dossier';
 export const ROUTING_DIRECT = 'direct';
@@ -24,13 +25,14 @@ export function routingMode(globalSettings) {
  * message just before the last user message. Mutates and returns whether anything
  * was added. Placement is an Open fork.
  * @param {{messages: Array}} body
- * @param {{t0?: string, t1?: string, t2?: string, handles?: string[]}} tiers
+ * `frames`: the RP may ask for frames with the <frames> tag (images on and frames toggle on).
+ * @param {{t0?: string, t1?: string, t2?: string, handles?: string[], frames?: boolean}} tiers
  */
-export function injectTiers(body, { t0 = '', t1 = '', t2 = '', handles = [] }) {
+export function injectTiers(body, { t0 = '', t1 = '', t2 = '', handles = [], frames = false }) {
     if (!Array.isArray(body?.messages)) return false;
     const msgs = body.messages;
     let added = false;
-    const near = [t1, t2, handles.length ? followUpInstruction(handles) : ''].filter(Boolean).join('\n\n');
+    const near = [t1, t2, handles.length ? followUpInstruction(handles, { frames }) : ''].filter(Boolean).join('\n\n');
     if (near) {
         let i = msgs.length - 1;
         while (i >= 0 && msgs[i].role !== 'user') i--;
@@ -47,14 +49,48 @@ export function injectTiers(body, { t0 = '', t1 = '', t2 = '', handles = [] }) {
     return added;
 }
 
-/** One-line progress / cost text for a preview (estimate + $ + Q3b hint). */
+/**
+ * Short text for the RTR extras on a plan: the coexist set and the GPU's free / needed
+ * VRAM. Older RTR reports none of them → ''.
+ */
+export function rtrExtrasText(plan) {
+    const { coSet, gpu } = rtrExtras(plan);
+    const bits = [];
+    if (coSet) bits.push(`set ${coSet}`);
+    if (gpu) {
+        const mb = (v) => (Number.isFinite(Number(v)) && v !== null ? `${Math.round(Number(v) / 1024 * 10) / 10} GiB` : '?');
+        const vram = gpu.free_mb != null || gpu.need_mb != null ? `${mb(gpu.free_mb)} free / ${mb(gpu.need_mb)} needed` : '';
+        const g = [gpu.name || '', vram].filter(Boolean).join(' ');
+        if (g) bits.push(g);
+    }
+    return bits.join(' · ');
+}
+
+/** One-line progress / cost text for a preview (estimate + $ + Q3b hint + RTR extras). */
 export function progressText(preview, { kind = 'dossier' } = {}) {
     if (!preview) return '';
     const what = kind === 'delta' ? 'Follow-up' : 'Media pass';
     const mode = preview.mode === 'swap' ? 'model swap' : preview.mode === 'solo' ? 'load' : 'no swap';
     const cost = preview.dollars == null ? '' : ` · ${formatDollars(preview.dollars)}`;
     const hint = preview.hint ? ` · ${preview.hint}` : '';
-    return `${what} (${mode}): ${preview.estimate?.label ?? ''}${cost}${hint}`;
+    const extras = rtrExtrasText(preview.plan);
+    return `${what} (${mode}): ${preview.estimate?.label ?? ''}${cost}${hint}${extras ? ` · ${extras}` : ''}`;
+}
+
+/**
+ * Settings hint from RTR's rp_vision (P7 #1). The "accepts images" setting stays the
+ * authority: this only suggests ticking it, or warns that RTR sees no projector.
+ * @param {{rpVision: boolean|null, rpAcceptsImages: boolean}} s
+ * @returns {{text: string, tone: 'info'|'warn'}|null}
+ */
+export function rpVisionHint({ rpVision, rpAcceptsImages }) {
+    if (rpVision === true && !rpAcceptsImages) {
+        return { tone: 'info', text: 'RTR reports an image projector on the running roleplay model, so key frames can be sent. Tick "The roleplay model accepts images" to send them.' };
+    }
+    if (rpVision === false && rpAcceptsImages) {
+        return { tone: 'warn', text: 'RTR reports no image projector on the running roleplay model; it may reject frames. Your setting still applies.' };
+    }
+    return null;
 }
 
 /**

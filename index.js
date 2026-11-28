@@ -33,6 +33,7 @@ import {
     framesBudget,
     dossierDuration,
     decideFramesForTurn,
+    requestedFrameTimes,
     buildFrameParts,
     frameAtArgs,
     createKeyFrameCache,
@@ -47,7 +48,7 @@ import { buildCapsule, buildMediaParts, mediaSeconds } from './prompts.js';
 import { itemHandle } from './queue.js';
 import { REGEN_CHOICES, dropdownOptions, resolveMediaModel } from './media-models.js';
 import { ROUTING_DOSSIER, ROUTING_DIRECT, routingMode, injectTiers, progressText, requeryBarModel,
-    itemCardModel, parseQuestionLines } from './protocol-view.js';
+    itemCardModel, parseQuestionLines, rpVisionHint } from './protocol-view.js';
 
 const SETTINGS_KEY = 'videoSupport';
 
@@ -84,17 +85,17 @@ const DEFAULTS = {
     jpegQuality: 0.7,
     maxUploadMB: 50, // refuse videos larger than this (base64 inflates ~33% on the wire)
     cdnBase: DEFAULT_CDN_BASE,
-    sendAudio: false, // frontend mode only: also send the soundtrack as an input_audio part
+    sendAudio: false, // direct (legacy) frontend mode only; dossier mode always sends audio to the media model
     debug: false,
     // P6 protocol
     routing: ROUTING_DOSSIER, // 'dossier' (media once via RTR, tiers after) | 'direct' (legacy re-send)
-    rtrBaseUrl: '',           // RTR on the box, e.g. https://<box>/rtr; empty = legacy path
+    rtrBaseUrl: '',           // box base URL without /v1 (guard routes media-dossier to RTR); empty = legacy path
     gpuLabel: '',             // keys the learned time averages (estimate.js)
     protocol: {},             // global layer of settings.js; per-chat layer is in chatMetadata
     stats: {},                // EMA timing averages, model|gpu → field → {v, n}
     mmproj: {},               // last mmproj_sha256 RTR reported per media model (soft key)
     // P7: key frames to an image-capable RP (dossier mode)
-    rpAcceptsImages: false,   // no capability detection exists; the user says so (Open fork)
+    rpAcceptsImages: false,   // the authority; RTR's rp_vision only drives a hint (P7 #1)
     sendFramesToRp: true,     // master toggle; does nothing while rpAcceptsImages is off
 };
 
@@ -132,6 +133,7 @@ function applySettingsToUI() {
     $('#video_support_rtr_url').val(settings().rtrBaseUrl);
     $('#video_support_gpu_label').val(settings().gpuLabel);
     renderProtocolSettings();
+    renderRpVisionHint();
     toggleFrontendOptions();
     updateTokenEstimate();
 }
@@ -190,6 +192,7 @@ function bindSettingsEvents() {
         settings().rpAcceptsImages = $(this).is(':checked');
         saveSettingsDebounced();
         renderItems();
+        renderRpVisionHint();
     });
     $('#video_support_rp_frames').on('change', function () {
         settings().sendFramesToRp = $(this).is(':checked');
@@ -744,7 +747,10 @@ let firstPass = null;          // in-flight first pass of the newest attachment
 let bypassFetch = 0;           // > 0 while our own question pass runs (re-entrancy)
 const itemStatus = new Map();  // itemId → {busy:{label}} | {error} | null
 const transcriptCache = createTranscriptCache(dossierStore);
-const framesRequested = new Set(); // item ids: user asked for frames on the next reply (one shot)
+// One shot per item for the next reply: null = the user's "Send frames" button (key frames),
+// times[] = the RP's <frames t="…"/> tag (explicit times, clamped to the frame budget when sent).
+const framesRequested = new Map();
+let rtrInfo = { rpVision: null, coSet: null, gpu: null, prefillRpS: null }; // last RTR extras seen
 let lastDecisions = [];
 
 function protocolActive() {
@@ -798,14 +804,15 @@ async function askQuestions({ prompt, schema, maxTokens }) {
     }
 }
 
-/** Media for the RTR call, from the stored file (frames/audio reuse the legacy caches). */
+/** Media for the RTR call, from the stored file (frames/audio reuse the legacy caches). Audio is always included. */
 async function getMediaForItem(_itemId, item) {
     const url = item?.media_url;
     if (!url) throw new Error('no stored media for this item');
     const dataUrl = await resolveVideoDataUrl(url);
     if (settings().mode === 'frontend') {
         const frames = await getFramesForVideo(url, dataUrl);
-        const audio = settings().sendAudio ? await getAudioForVideo(url, dataUrl) : null;
+        // Dossier mode always sends the soundtrack (P6 #19): the transcript and timeline need it.
+        const audio = await getAudioForVideo(url, dataUrl);
         const fps = settings().fps;
         return { mediaParts: buildMediaParts({ mode: 'frontend', frames, fps, audioB64: audio }), mediaSeconds: mediaSeconds({ frames, fps }) };
     }
@@ -826,7 +833,24 @@ const protocol = createProtocol({
     knownMmproj: (lsId) => settings().mmproj?.[lsId],
     rememberMmproj: (lsId, sha) => { settings().mmproj = { ...(settings().mmproj || {}), [lsId]: sha }; saveSettingsDebounced(); },
     onStatus: (id, st) => { itemStatus.set(id, st); renderItems(); },
+    onRtrInfo: (x) => {
+        // Older RTR sends no extras: keep the last known rp_vision rather than clearing it.
+        rtrInfo = { ...x, rpVision: x.rpVision ?? rtrInfo.rpVision };
+        renderRpVisionHint();
+    },
 });
+
+function renderRpVisionHint() {
+    const el = $('#video_support_rp_vision_hint');
+    if (!el.length) return;
+    const h = rpVisionHint({ rpVision: rtrInfo.rpVision, rpAcceptsImages: !!settings().rpAcceptsImages });
+    el.toggle(!!h).text(h?.text || '').toggleClass('tone-warn', h?.tone === 'warn');
+}
+
+/** The RP takes frames: the user's setting (the authority) and the frames toggle. */
+function rpFramesOn() {
+    return !!settings().rpAcceptsImages && !!settings().sendFramesToRp;
+}
 
 function trackFirstPass(p) {
     const tracked = p.catch(err => console.error('[VideoSupport] Media first pass failed:', err))
@@ -876,7 +900,7 @@ async function injectProtocolTiers(options) {
     const body = JSON.parse(options.body);
     const tiers = await buildTiers(items, lastUserText(body.messages), protocolSettings(), transcriptCache);
     for (const [id, badge] of tiers.badges) itemStatus.set(id, { ...(itemStatus.get(id) || {}), transcriptBadge: badge });
-    const added = injectTiers(body, { t0: tiers.t0.text, t1: tiers.t1.text, t2: tiers.t2.text, handles: items.map(it => itemHandle(it.id)) });
+    const added = injectTiers(body, { t0: tiers.t0.text, t1: tiers.t1.text, t2: tiers.t2.text, handles: items.map(it => itemHandle(it.id)), frames: rpFramesOn() });
     if (added && settings().debug) console.debug('[VideoSupport] Tiers', { t0: tiers.t0.tokens, t1: tiers.t1.tokens, t2: tiers.t2.tokens });
     let framed = false;
     try {
@@ -894,19 +918,23 @@ async function injectProtocolTiers(options) {
  * else the active item. Audio/video is never re-sent here.
  */
 async function addRpFrames(body, items, tiers, ownedUrl) {
-    if (!settings().rpAcceptsImages || !settings().sendFramesToRp) return false;
+    if (!rpFramesOn()) return false;
     const s = protocolSettings();
     const k = framesBudget(s.rpFrames, settings().tokensPerFrame, s.rpFrameCtx);
     const urlById = new Map(dossierStore.listItems().map(x => [x.id, x.item.media_url]));
     const ownedItem = ownedUrl ? items.find(it => urlById.get(it.id) === ownedUrl) : null;
-    const it = ownedItem || tiers.active;
+    // An item the RP asked frames for (<frames> tag) comes before the active item.
+    const tagged = items.find(x => Array.isArray(framesRequested.get(x.id)));
+    const it = ownedItem || tagged || tiers.active;
     if (!it?.version) return false;
     const d = it.version.dossier || {};
     const selected = selectFrameTimes(d.key_frames, k, dossierDuration(d));
+    const asked = framesRequested.get(it.id);
     const userAsked = framesRequested.has(it.id);
+    const requested = Array.isArray(asked) ? requestedFrameTimes(asked, k, dossierDuration(d)) : [];
     const decision = decideFramesForTurn({
         rpImages: true, enabled: true, k, selected,
-        replyToMedia: !!ownedItem, userAsked,
+        replyToMedia: !!ownedItem, userAsked, requested,
         citedTimes: parseTimestamps(lastUserText(body.messages)), t2Hits: tiers.t2.hits,
     });
     if (!decision.frames.length) return false;
@@ -925,7 +953,11 @@ async function addRpFrames(body, items, tiers, ownedUrl) {
     return true;
 }
 
-/** RP reply done: strip <media_q>, queue, then auto / confirm per item. [U] runs after streaming ends. */
+/**
+ * RP reply done: strip <media_q> and <frames>, queue, then auto / confirm per item.
+ * <frames> requests become one-shot frame requests for the next reply (no auto-continue);
+ * they are ignored (still stripped) while the RP is not set to take frames. [U] runs after streaming ends.
+ */
 async function onMessageReceived(messageId) {
     if (!protocolActive()) return;
     const msg = chat[messageId];
@@ -942,6 +974,13 @@ async function onMessageReceived(messageId) {
         if (Array.isArray(msg.swipes)) msg.swipes[msg.swipe_id ?? 0] = out.text;
         try { stContext().updateMessageBlock?.(messageId, msg); } catch (err) { console.warn('[VideoSupport] Could not redraw message:', err); }
         await saveChatConditional();
+    }
+    if (out.frames?.length && rpFramesOn()) {
+        for (const f of out.frames) {
+            const prev = framesRequested.get(f.itemId);
+            framesRequested.set(f.itemId, [...(Array.isArray(prev) ? prev : []), ...f.times]);
+        }
+        if (settings().debug) console.debug('[VideoSupport] RP asked for frames', out.frames);
     }
     lastDecisions = out.decisions;
     renderRequeryBar();
@@ -984,10 +1023,14 @@ function renderItems() {
         }
         if (vm.canAsk) row.append($('<button>', { class: 'menu_button', text: 'Ask' }).on('click', () => openDialog(id, 'ask')));
         if (vm.canRegenerate) row.append($('<button>', { class: 'menu_button', text: 'Regenerate' }).on('click', () => openDialog(id, 'regenerate')));
-        if (vm.canRegenerate && settings().rpAcceptsImages && settings().sendFramesToRp) {
+        if (vm.canRegenerate && rpFramesOn()) {
             const on = framesRequested.has(id);
-            row.append($('<button>', { class: 'menu_button', text: on ? 'Frames: next reply' : 'Send frames', title: 'Send this item\'s key frames to the RP on the next reply' })
-                .on('click', () => { if (framesRequested.has(id)) framesRequested.delete(id); else framesRequested.add(id); renderItems(); }));
+            const tagTimes = framesRequested.get(id);
+            const title = Array.isArray(tagTimes)
+                ? `The roleplay model asked for frames at ${tagTimes.join(', ')} s; they go with the next reply. Click to cancel.`
+                : 'Send this item\'s key frames to the RP on the next reply';
+            row.append($('<button>', { class: 'menu_button', text: on ? 'Frames: next reply' : 'Send frames', title })
+                .on('click', () => { if (framesRequested.has(id)) framesRequested.delete(id); else framesRequested.set(id, null); renderItems(); }));
         }
         box.append(row);
     }
@@ -1230,9 +1273,9 @@ function createSettingsUI() {
                 <div class="video-support-setting">
                     <label class="checkbox_label" for="video_support_send_audio">
                         <input type="checkbox" id="video_support_send_audio" />
-                        Also send the video's audio (frontend mode)
+                        Also send the video's audio (direct routing, frontend mode)
                     </label>
-                    <small class="video-support-hint">Decodes the soundtrack in the browser (mono, 16 kHz WAV) and sends it as an input_audio part after the frames. Only for audio-capable models (e.g. LFM3-Omni); other servers may reject it. Adds about 2 MB of base64 per minute.</small>
+                    <small class="video-support-hint">Decodes the soundtrack in the browser (mono, 16 kHz WAV) and sends it as an input_audio part after the frames. Only for audio-capable models (e.g. LFM3-Omni); other servers may reject it. Adds about 2 MB of base64 per minute. Dossier routing ignores this box and always sends the audio to the media model, because the transcript and timeline need it.</small>
                 </div>
                 <div class="video-support-setting">
                     <label class="checkbox_label" for="video_support_debug">
@@ -1252,8 +1295,8 @@ function createSettingsUI() {
                 </div>
                 <div class="video-support-setting">
                     <label for="video_support_rtr_url">RTR URL</label>
-                    <input type="text" id="video_support_rtr_url" class="text_pole" placeholder="https://your-box/rtr" />
-                    <small class="video-support-hint">Base URL of the media router on the GPU box (the extension adds /v1/chat/completions). The browser calls it directly.</small>
+                    <input type="text" id="video_support_rtr_url" class="text_pole" placeholder="https://your-box" />
+                    <small class="video-support-hint">Base URL of the GPU box, the same one the chat API uses, without /v1. The extension adds /v1/chat/completions with model "media-dossier", and the box's guard passes that to the media router (RTR). The browser calls it directly, so the box must allow your SillyTavern origin (see LLAMACPP_SETUP.md).</small>
                 </div>
                 <div class="video-support-setting">
                     <label for="video_support_gpu_label">GPU label</label>
@@ -1269,7 +1312,8 @@ function createSettingsUI() {
                         <input type="checkbox" id="video_support_rp_frames" />
                         Send key frames to the roleplay model
                     </label>
-                    <small class="video-support-hint">Dossier mode only. The reply right after a video is processed gets its top key frames (K below, default 3) as images, each captioned with its timestamp. Later replies get frames only when you cite a timestamp the dossier matches, or press "Send frames" on the item. About K × tokens per frame each time. Audio and video are never re-sent.</small>
+                    <small class="video-support-hint">Dossier mode only. The reply right after a video is processed gets its top key frames (K below, default 3) as images, each captioned with its timestamp. Later replies get frames only when you cite a timestamp the dossier matches, press "Send frames" on the item, or the roleplay model asks with a &lt;frames t="…"/&gt; tag (those go with your next message, at most K). About K × tokens per frame each time. Audio and video are never re-sent.</small>
+                    <small id="video_support_rp_vision_hint" class="video-support-hint" style="display:none"></small>
                 </div>
                 <div class="video-support-setting">
                     <label>Dossier settings</label>

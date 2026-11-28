@@ -145,6 +145,7 @@
 
 .video-support-badge.tone-good { color: #8fd18f; }
 .video-support-badge.tone-warn { color: #e8c062; }
+.video-support-hint.tone-warn { color: #e8c062; }
 .video-support-badge.tone-bad { color: #ef7d7d; }
 .video-support-badge.tone-info { color: var(--SmartThemeQuoteColor, #7eb8f7); }
 

@@ -13,11 +13,11 @@
 import { compareKey } from './dossier-store.js';
 import { PROMPT_VERSION, QUESTION_SCHEMA, questionPrompt, parseQuestionPass, buildCapsule,
     extractionMessages, deltaMessages, DEFAULT_CHECKLIST } from './prompts.js';
-import { parseMediaQ, enqueue, resolveItemRef, decideRequery, piggybackItems, mergeDelta,
+import { parseMediaQ, parseFramesTag, enqueue, resolveItemRef, decideRequery, piggybackItems, mergeDelta,
     requeryRecord, removeFlushed, triggerMet } from './queue.js';
 import { recordTimings, estimate, dollars, coexistSetExists, lfm3HintVisible, LFM3_HINT } from './estimate.js';
 import { resolveMediaModel, modelByLsId, mmMaxTokens, MEDIA_MODELS, DEFAULT_MEDIA_MODEL } from './media-models.js';
-import { RtrError, describeRtrError } from './rtr-client.js';
+import { RtrError, describeRtrError, rtrExtras } from './rtr-client.js';
 
 /**
  * @typedef {object} ProtocolDeps
@@ -34,6 +34,8 @@ import { RtrError, describeRtrError } from './rtr-client.js';
  * @property {(lsId: string) => string|undefined} knownMmproj   last mmproj sha seen for a model
  * @property {(lsId: string, sha: string) => void} rememberMmproj
  * @property {(itemId: string, status: object|null) => void} [onStatus]  progress / error for badges
+ * @property {(extras: {rpVision: boolean|null, coSet: string|null, gpu: object|null, prefillRpS: number|null}) => void} [onRtrInfo]
+ *           RTR extras from each plan or result (newer RTR; all null from older RTR)
  * @property {() => string} [now]
  */
 
@@ -93,9 +95,16 @@ export function createProtocol(deps) {
         await deps.store.updateItem(itemId, it => { it.selected_model = key; });
     }
 
+    function rtrInfo(res) {
+        if (res && typeof res === 'object') deps.onRtrInfo?.(rtrExtras(res));
+    }
+
     async function planFor(model) {
-        try { return await deps.rtr.plan({ mediaModel: model.lsId, rpModel: deps.rpModel?.() || undefined }); }
+        let plan;
+        try { plan = await deps.rtr.plan({ mediaModel: model.lsId, rpModel: deps.rpModel?.() || undefined }); }
         catch { return null; }
+        rtrInfo(plan);
+        return plan;
     }
 
     /** Estimate + the Q3b hint for one call. */
@@ -137,11 +146,11 @@ export function createProtocol(deps) {
     }
 
     /** Apply one delta (main call or flushed) to an item and clear what it answered. */
-    async function applyDeltaTo(itemId, delta, { questions, mediaModel, status: st, wallS, trigger }) {
+    async function applyDeltaTo(itemId, delta, { questions, mediaModel, status: st, wallS, trigger, repaired }) {
         const v = deps.store.activeVersion(itemId);
         if (!v || !delta) return null;
         const { dossier, speech } = mergeDelta(v.dossier, delta);
-        const record = requeryRecord({ questions, mediaModel, status: st, at: now(), wallS, trigger });
+        const record = requeryRecord({ questions, mediaModel, status: st, at: now(), wallS, trigger, repaired });
         delete record.transcript;
         const r = await deps.store.applyDelta(itemId, { dossier, speech, record });
         const ids = questions.map(q => q.id);
@@ -153,12 +162,13 @@ export function createProtocol(deps) {
         for (const f of res?.flushed || []) {
             const sent = flush.find(x => x.id === f.id);
             if (!sent || f.status === 'failed' || !f.delta) continue;
-            await applyDeltaTo(f.id, f.delta, { questions: sent.questions, mediaModel: res.media_model, status: f.status, wallS: res.timings?.flush_s, trigger: `piggyback:${trigger}` });
+            await applyDeltaTo(f.id, f.delta, { questions: sent.questions, mediaModel: res.media_model, status: f.status, wallS: res.timings?.flush_s, trigger: `piggyback:${trigger}`, repaired: f.repaired });
         }
     }
 
     function learn(res, mediaSeconds) {
         if (!res) return;
+        rtrInfo(res);
         deps.setStats(recordTimings(deps.getStats(), res, { gpu: gpu(), mediaSeconds }));
         if (typeof res.mmproj_sha256 === 'string' && res.mmproj_sha256) deps.rememberMmproj(res.media_model, res.mmproj_sha256);
     }
@@ -269,14 +279,26 @@ export function createProtocol(deps) {
     }
 
     /**
-     * After an RP reply: strip <media_q>, queue the questions, decide per item.
+     * After an RP reply: strip <media_q> and <frames>, queue the questions, decide per item.
+     * Frame requests are only resolved to items here (an empty or unknown item falls back
+     * to the active item, else the only item); the caller decides whether frames are on.
      * Auto requeries are started (not awaited) and returned as promises.
-     * @returns {Promise<{text: string, decisions: Array<{itemId, action, reason, preview?}>, auto: Promise[]}>}
+     * @returns {Promise<{text: string, decisions: Array<{itemId, action, reason, preview?}>, auto: Promise[],
+     *   frames: Array<{itemId: string, times: number[]}>}>}
      */
     async function afterRpTurn({ text, turn, activeItemId = null }) {
-        const { text: shown, questions } = parseMediaQ(text);
+        const { text: noQ, questions } = parseMediaQ(text);
+        const { text: shown, requests } = parseFramesTag(noQ);
         const items = deps.store.listItems().filter(x => x.item.versions?.length)
             .map(x => ({ id: x.id, title: x.item.title }));
+        const frameFallback = activeItemId ?? (items.length === 1 ? items[0].id : null);
+        const framesByItem = new Map();
+        for (const r of requests) {
+            const id = resolveItemRef(r.item, items, frameFallback);
+            if (!id) continue;
+            framesByItem.set(id, [...(framesByItem.get(id) || []), ...r.times]);
+        }
+        const frames = [...framesByItem].map(([itemId, times]) => ({ itemId, times }));
         const byItem = new Map();
         for (const q of questions) {
             const id = resolveItemRef(q.item, items, activeItemId);
@@ -301,7 +323,7 @@ export function createProtocol(deps) {
             decisions.push({ itemId: id, ...d, preview: pv });
             if (d.action === 'auto') auto.push(requery(id, 'auto', { turn }));
         }
-        return { text: shown, questions, decisions, auto };
+        return { text: shown, questions, decisions, auto, frames };
     }
 
     /** Add user questions to an item's queue (Ask). */
