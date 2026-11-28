@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
     MAX_KEY_FRAMES, framesBudget, dossierDuration, uniformFrameTimes, selectFrameTimes, frameCaption,
     decideFramesForTurn, requestedFrameTimes, REQUESTED_WHY, buildFrameParts, frameAtArgs, createKeyFrameCache, appendPartsToLastUser,
-    AUTO_CONTINUE_MAX, decideAutoContinue,
+    AUTO_CONTINUE_MAX, decideAutoContinue, pickFramesItem,
 } from './video-utils.js';
 import { defaultSettings } from './settings.js';
 
@@ -184,4 +184,27 @@ test('F-C: decideAutoContinue does not fire without a resolved tag, with frames 
     assert.equal(decideAutoContinue({ ...a, dryRun: true }).why, 'not a chat reply');
     assert.equal(decideAutoContinue({ ...a, genType: null }).fire, true);   // unknown type = normal send
     assert.equal(decideAutoContinue({ ...a, count: -3 }).count, 1);
+});
+
+test('Fold 8: auto-continue prefers the tagged item over the owned item (A owned, B tagged)', () => {
+    const A = { id: 'A' }, B = { id: 'B' }, act = { id: 'act' };
+    assert.deepEqual(pickFramesItem({ owned: A, tagged: B, active: act, autoContinue: true }), { item: B, replyToMedia: false });
+    // B's requested times are what the turn sends, so the tag is used up in this auto-continue.
+    const req = requestedFrameTimes([40, 41], 3, 100);
+    const { replyToMedia } = pickFramesItem({ owned: A, tagged: B, active: act, autoContinue: true });
+    assert.deepEqual(decideFramesForTurn({ rpImages: true, enabled: true, k: 3, selected: kf(1, 2, 3), replyToMedia, userAsked: true, requested: req }),
+        { reason: 'requested', frames: req });
+    // Same item owned and tagged: the requested times win over the first-reply frames.
+    assert.deepEqual(pickFramesItem({ owned: A, tagged: A, autoContinue: true }), { item: A, replyToMedia: false });
+});
+
+test('Fold 8: a turn that is not an auto-continue keeps owned > tagged > active', () => {
+    const A = { id: 'A' }, B = { id: 'B' }, act = { id: 'act' };
+    assert.deepEqual(pickFramesItem({ owned: A, tagged: B, active: act, autoContinue: false }), { item: A, replyToMedia: true });
+    assert.deepEqual(pickFramesItem({ owned: A, tagged: A, active: act }), { item: A, replyToMedia: true });
+    assert.deepEqual(pickFramesItem({ owned: null, tagged: B, active: act }), { item: B, replyToMedia: false });
+    assert.deepEqual(pickFramesItem({ owned: null, tagged: null, active: act }), { item: act, replyToMedia: false });
+    // Auto-continue with no tagged item falls back to the normal order.
+    assert.deepEqual(pickFramesItem({ owned: A, tagged: null, active: act, autoContinue: true }), { item: A, replyToMedia: true });
+    assert.deepEqual(pickFramesItem({}), { item: null, replyToMedia: false });
 });

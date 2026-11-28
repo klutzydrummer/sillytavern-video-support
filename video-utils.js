@@ -239,6 +239,22 @@ export function decideAutoContinue(a) {
     return { fire: true, count: count + 1, why: 'frames requested' };
 }
 
+/**
+ * Which item's frames this RP turn gets (Fold 8, "Prefer tagged").
+ * In an auto-continue (the follow-up fired after a <frames/> tag) a tag-requested item comes
+ * first, so the RP's request is used up and no second auto-continue is wasted; its requested
+ * times also beat the owned item's first-reply frames. Any other turn is unchanged:
+ * owned item (reply right after processing), else the tagged item, else the active item.
+ * @param {{owned?: object|null, tagged?: object|null, active?: object|null, autoContinue?: boolean}} a
+ * @returns {{item: object|null, replyToMedia: boolean}}
+ */
+export function pickFramesItem(a) {
+    const owned = a?.owned || null, tagged = a?.tagged || null;
+    if (a?.autoContinue && tagged) return { item: tagged, replyToMedia: false };
+    const item = owned || tagged || a?.active || null;
+    return { item, replyToMedia: !!owned && item === owned };
+}
+
 /** Caption sent as text before each frame: "t=12.0 s: why". */
 export function frameCaption(t, why = '') {
     const w = String(why || '').trim();

@@ -33,6 +33,7 @@ import {
     framesBudget,
     dossierDuration,
     decideFramesForTurn,
+    pickFramesItem,
     requestedFrameTimes,
     buildFrameParts,
     frameAtArgs,
@@ -611,7 +612,7 @@ function findLastUserMessage(messages) {
 // ---------------------------------------------------------------------------
 
 async function onMessageSent(messageId) {
-    autoContinue.count = 0; autoContinue.pending = false; // a real user message starts a new turn
+    autoContinue.count = 0; autoContinue.pending = false; autoContinue.running = false; // a real user message starts a new turn
     if (!pendingVideo) return;
 
     const { dataUrl, fileName } = pendingVideo;
@@ -711,7 +712,7 @@ const storageAdapter = {
 const dossierStore = createStore(storageAdapter);
 
 async function onChatChanged() {
-    autoContinue.count = 0; autoContinue.pending = false;
+    autoContinue.count = 0; autoContinue.pending = false; autoContinue.running = false;
     transcriptCache.clear();
     lastDecisions = [];
     renderRequeryBar();
@@ -756,8 +757,9 @@ const framesRequested = new Map();
 let rtrInfo = { rpVision: null, coSet: null, gpu: null, prefillRpS: null }; // last RTR extras seen
 let lastDecisions = [];
 // Capped auto-continue after <frames/> tags (Fold 7): count since the last user message,
-// pending = fire once the current generation has ended.
-const autoContinue = { count: 0, pending: false };
+// pending = fire once the current generation has ended; running = the generation in progress
+// is an auto-continue (its tagged item's frames go first, pickFramesItem).
+const autoContinue = { count: 0, pending: false, running: false };
 
 /**
  * Start a normal generation, as the Send button does, so the RP gets the frames it asked for.
@@ -775,8 +777,9 @@ async function triggerGeneration() {
 function maybeAutoContinue() {
     if (!autoContinue.pending || currentGenType !== null) return;
     autoContinue.pending = false;
+    autoContinue.running = true;
     setTimeout(() => {
-        triggerGeneration().catch(err => console.error('[VideoSupport] Auto-continue for frames failed:', err));
+        triggerGeneration().catch(err => { autoContinue.running = false; console.error('[VideoSupport] Auto-continue for frames failed:', err); });
     }, 0);
 }
 
@@ -950,9 +953,10 @@ async function addRpFrames(body, items, tiers, ownedUrl) {
     const k = framesBudget(s.rpFrames, settings().tokensPerFrame, s.rpFrameCtx);
     const urlById = new Map(dossierStore.listItems().map(x => [x.id, x.item.media_url]));
     const ownedItem = ownedUrl ? items.find(it => urlById.get(it.id) === ownedUrl) : null;
-    // An item the RP asked frames for (<frames> tag) comes before the active item.
+    // An item the RP asked frames for (<frames> tag) comes before the active item, and in an
+    // auto-continue before the owned item too (Fold 8).
     const tagged = items.find(x => Array.isArray(framesRequested.get(x.id)));
-    const it = ownedItem || tagged || tiers.active;
+    const { item: it, replyToMedia } = pickFramesItem({ owned: ownedItem, tagged, active: tiers.active, autoContinue: autoContinue.running });
     if (!it?.version) return false;
     const d = it.version.dossier || {};
     const selected = selectFrameTimes(d.key_frames, k, dossierDuration(d));
@@ -961,7 +965,7 @@ async function addRpFrames(body, items, tiers, ownedUrl) {
     const requested = Array.isArray(asked) ? requestedFrameTimes(asked, k, dossierDuration(d)) : [];
     const decision = decideFramesForTurn({
         rpImages: true, enabled: true, k, selected,
-        replyToMedia: !!ownedItem, userAsked, requested,
+        replyToMedia, userAsked, requested,
         citedTimes: parseTimestamps(lastUserText(body.messages)), t2Hits: tiers.t2.hits,
     });
     if (!decision.frames.length) return false;
@@ -1408,7 +1412,7 @@ jQuery(async () => {
         currentGenType = type || 'normal';
         currentGenDryRun = !!dryRun;
     });
-    eventSource.on(event_types.GENERATION_ENDED, () => { currentGenType = null; maybeAutoContinue(); });
-    eventSource.on(event_types.GENERATION_STOPPED, () => { currentGenType = null; autoContinue.pending = false; });
+    eventSource.on(event_types.GENERATION_ENDED, () => { currentGenType = null; autoContinue.running = false; maybeAutoContinue(); });
+    eventSource.on(event_types.GENERATION_STOPPED, () => { currentGenType = null; autoContinue.pending = false; autoContinue.running = false; });
     console.log('[VideoSupport] Loaded');
 });
